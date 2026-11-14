@@ -12,3 +12,10 @@ Steps:
 3. New Project > Deploy from GitHub repo > repo ta select koro.
 4. Variables e jao, add: TELEGRAM_BOT_TOKEN = BotFather theke pawa token (pura ta).
 5. Deploy hoye gele Telegram e @Predictfun_testing_bot khule /start likho, tarpor /fund likho.
+
+v2 - LIVE in the same bot:
+- Paper is default (/startbot). Live is /livestart.
+- Railway Variables to add for Live:
+  PREDICT_API_KEY, PREDICT_WALLET_PRIVATE_KEY, LIVE_TRADING (0=check only, 1=real orders)
+- After uploading the new telegram-demo-bot.py + requirements.txt +
+  Dockerfile, Railway redeploys automatically. Test /mode, then /livestart.
