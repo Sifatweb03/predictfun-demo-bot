@@ -1,0 +1,7 @@
+{
+  "starting_fund": 10.0,
+  "stake1": 1.0,
+  "stake2": 2.0,
+  "daily_loss_limit": 0.0,
+  "max_consecutive_losses": 3
+}
