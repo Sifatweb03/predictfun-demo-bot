@@ -82,6 +82,22 @@ demo now returns True whenever live_running is off, regardless of the
 LIVE_TRADING env var; CHECK mode (LIVE_TRADING=0, live_running on)
 still uses `placed`. See _step_filled.
 
+DEMO REAL-BOOK PAYOUT CHECK (v4.13, 2026-11-18): demo/paper mode now
+reads the REAL Predict.fun orderbook at each paper trade and applies
+the min-payout filter (default 1.5x), exactly like live mode — but
+places NO order, builds nothing, signs nothing, sends nothing. A
+paper step whose payout is too low is skipped and counts $0 at
+settlement (recorded in `placed`, read by _step_filled); a step that
+passes counts as filled. The check runs at once in demo mode — no
+deferral (paper mode has no delay; see test-v4-fill-fix.py section 6)
+— so it reads the book as it is at trigger time; a thin book may make
+the payout look low and skip the step, which is the conservative
+direction for a demo. No min-payout retry in demo (live retries at
++60s/+120s), so demo may skip a few trades live would take on retry.
+Demo PnL is now closer to live (payout filter applied) but still
+assumes every passing order fills — it does not simulate actual fills.
+See _demo_payout_check.
+
 ETH 15m FILL FIX (2026-11-16): the ETH 15m orderbook is thin right
 after a market opens, so a market order placed at the trigger often
 finds no seller and gets CANCELLED (round 1 and round 2 both failed
@@ -1282,9 +1298,14 @@ def bot_loop(chat_id):
         The deployed bot has LIVE_TRADING=1, so the old `if not
         LIVE_TRADING` gate sent demo mode into the live branch, where no
         live order was ever tracked and every paper win returned False
-        ("step 1 never filled", +$0.00). Demo now returns True first."""
+        ("step 1 never filled", +$0.00). Demo now returns True first.
+        v4.13: demo now reads the real orderbook payout check
+        (_demo_payout_check) and records the result in `placed`, so a
+        low-payout paper step returns False ($0) instead of True.
+        Default True if the check never ran, so a missed check can't
+        zero out a paper win."""
         if not live_running:
-            return True
+            return placed.get((pair, rnd, step), True)
         if not LIVE_TRADING:
             return placed.get((pair, rnd, step), False)
         key = (pair, rnd, step)
@@ -1515,11 +1536,51 @@ def bot_loop(chat_id):
         except Exception as e:
             send(chat_id, f"Live order FAILED {pair} round {ps['round_no']}: {e}")
 
+    def _demo_payout_check(pair):
+        """Demo mode (v4.13): read the REAL orderbook for the current step
+        and apply the min-payout filter, exactly like live mode does —
+        but place NO order, build nothing, sign nothing, send nothing.
+        Returns True if the paper step passes (recorded in `placed` as
+        True, counts as filled) or False if the payout is too low
+        (recorded as False, counts $0 at settlement). On any orderbook
+        read failure, records True (old demo behavior) so a feed hiccup
+        can't zero out paper wins. No min-payout retry in demo (v4.13):
+        a skipped step just counts $0; live retries at +60s/+120s, so
+        demo may skip a few trades live would take on retry."""
+        ps = pair_state[pair]
+        step = 1 if ps["state"] == "bet1" else 2
+        bet_open = ps["bet_open"]
+        if bet_open is None:
+            return True
+        try:
+            _m, _o, price, _a, _b, _n = _pf_quote(
+                ps["bet_dir"], ps["bet_stake"],
+                market_start=bet_open // 1000, pair=pair)
+        except Exception as e:
+            print(f"[demo payout check {pair}] quote failed: {e}", flush=True)
+            placed[(pair, ps["round_no"], step)] = True
+            return True
+        min_ratio = config.get("min_payout", 1.5)
+        if min_ratio and min_ratio > 0 and price and price > 0:
+            payout = ps["bet_stake"] / price
+            ratio = payout / ps["bet_stake"]
+            if ratio < min_ratio:
+                placed[(pair, ps["round_no"], step)] = False
+                send(chat_id, f"⏭️ SKIP {pair} round {ps['round_no']} step {step}: payout ${payout:.2f} on ${ps['bet_stake']:.0f} ({ratio:.2f}x < {min_ratio:.2f}x) - too low (demo, real book).")
+                return False
+        placed[(pair, ps["round_no"], step)] = True
+        return True
+
     def _schedule_order(pair):
         """Decide when the current step's LIVE order goes out. If the pair
         has an order delay (ETH 30s) and we are live, defer it until
         order_due_at so the book can populate; otherwise place it now.
-        In paper mode there is no real order, so nothing is deferred."""
+        In demo mode there is no real order, so the demo payout check
+        (v4.13) runs at once — no deferral, matching the old paper-mode
+        rule (see test-v4-fill-fix.py section 6: paper mode has no delay).
+        The check reads the book as it is at trigger time; a thin book
+        may make the payout look low and skip the step, which is the
+        conservative direction for a demo."""
         ps = pair_state[pair]
         delay = PAIRS[pair].get("order_delay_sec", 0)
         if live_running and delay > 0:
@@ -1529,6 +1590,7 @@ def bot_loop(chat_id):
             if live_running:
                 _place_current_step(pair)
             else:
+                _demo_payout_check(pair)
                 ps["order_placed"] = True
 
     def _pair_step(pair):
@@ -1556,10 +1618,19 @@ def bot_loop(chat_id):
         # Place a deferred LIVE order whose delay has elapsed (ETH: 30s so
         # the book can populate). Only while the round is still active and
         # the bet candle is known - a toggle off in the meantime drops the
-        # state to idle, so nothing is placed after a toggle.
+        # state to idle, so nothing is placed after a toggle. In demo mode
+        # _schedule_order runs the payout check at once and sets
+        # order_placed, so this branch normally never fires in demo; the
+        # live_running guard below is defense in depth — this branch must
+        # NEVER call _place_current_step in demo, which would place a real
+        # order.
         if (ps["state"] in ("bet1", "bet2") and not ps["order_placed"]
                 and bet_open is not None and time.time() >= ps["order_due_at"]):
-            _place_current_step(pair)
+            if live_running:
+                _place_current_step(pair)
+            else:
+                _demo_payout_check(pair)
+                ps["order_placed"] = True
         if ps["state"] in ("bet1", "bet2") and bet_open is not None:
             done = [k for k in closed if int(k[0]) == bet_open]
             if not done and time.time() * 1000 > bet_open + 3 * tf_sec * 1000:
