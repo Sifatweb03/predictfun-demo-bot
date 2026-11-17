@@ -73,6 +73,15 @@ offered Yes prices for No tokens) and why the second-chance returns
 looked absurd (257%/488% - the real No returns were ~39%/20%). UP
 bets were never affected. See _pf_quote.
 
+DEMO _step_filled FIX (v4.12, 2026-11-18): in demo/paper mode every
+paper win showed "step 1 never filled" and +$0.00 (last 5 rounds, all
+wins). Cause: _step_filled gated demo on `if not LIVE_TRADING`, but
+the deployed bot has LIVE_TRADING=1, so demo mode fell into the live
+branch where no live order was ever tracked and returned False. Fix:
+demo now returns True whenever live_running is off, regardless of the
+LIVE_TRADING env var; CHECK mode (LIVE_TRADING=0, live_running on)
+still uses `placed`. See _step_filled.
+
 ETH 15m FILL FIX (2026-11-16): the ETH 15m orderbook is thin right
 after a market opens, so a market order placed at the trigger often
 finds no seller and gets CANCELLED (round 1 and round 2 both failed
@@ -1267,10 +1276,16 @@ def bot_loop(chat_id):
         has processed that fill, returning the stale False would make the
         paper balance miss a real fill (a win counted as $0, or a loss
         counted as $0 when money was really risked). So a cached False is
-        re-checked against any still-pending order for this step."""
+        re-checked against any still-pending order for this step.
+        BUG FIX (v4.12): demo/paper mode must return True whenever
+        live_running is off, regardless of the LIVE_TRADING env var.
+        The deployed bot has LIVE_TRADING=1, so the old `if not
+        LIVE_TRADING` gate sent demo mode into the live branch, where no
+        live order was ever tracked and every paper win returned False
+        ("step 1 never filled", +$0.00). Demo now returns True first."""
+        if not live_running:
+            return True
         if not LIVE_TRADING:
-            if not live_running:
-                return True
             return placed.get((pair, rnd, step), False)
         key = (pair, rnd, step)
         if key in filled and filled[key] is True:
