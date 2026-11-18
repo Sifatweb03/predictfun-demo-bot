@@ -165,7 +165,14 @@ DEFAULT_CONFIG = {
     "stake1": 1.0,
     "stake2": 2.0,
     # Per-pair on/off - /btc off, /eth on, /eth5 off. Saved, so it survives a redeploy.
-    "pairs": {"BTC": False, "BTC15": True, "ETH": True, "ETH5": True},
+    # v4.14 (2026-11-18): BTC15 is OFF by default (Dec 1 plan: only the 2 ETH
+    # 15m strategies run live; BTC15 kept turning ON after every redeploy
+    # because the GitHub bot_config.json had no "pairs" key, so the v4.6
+    # migration fired and set BTC15=True. Fixed by uploading the correct
+    # config AND by making the default + migration OFF here).
+    # BTC1H/ETH1H (1h N=2, added v4.14) are OFF by default too.
+    "pairs": {"BTC": False, "BTC15": False, "ETH": True, "ETH5": True,
+              "BTC1H": False, "ETH1H": False},
     # Pause hour (Dhaka 20:00-21:00) - /pause on|off. Saved, survives a redeploy.
     "pause_20": True,
     # Minimum payout ratio - /setminpayout 1.5. A live order is skipped
@@ -224,6 +231,29 @@ PAIRS = {
                            "https://api.binance.us/api/v3/ticker/bookTicker?symbol=ETHUSDT"],
              "seed_url": "https://data-api.binance.vision/api/v3/klines?symbol=ETHUSDT&interval=15m&limit=12",
              "fallback_url": "https://api.binance.us/api/v3/klines?symbol=ETHUSDT&interval=15m&limit=12"},
+    # BTC1H / ETH1H: 1h N=2 reversal (added 2026-11-18, v4.14). 1-year
+    # backtest (Binance 1h, paper 1:1): BTC 1h N=2 +$295 (78.9% win, DD $39),
+    # ETH 1h N=2 +$243 (78.3% win, DD $33); 3-year: BTC +$621, ETH +$784,
+    # every year profitable. OFF by default - the user asked to add them
+    # but keep them off. Category slugs follow the 5m/15m pattern
+    # (btc-updown-1h / eth-updown-1h); verify against Predict.fun when
+    # first turned on. Same 30s order delay as the 15m pairs (book thin
+    # at market open). Each has its own feed and state machine, like
+    # BTC/BTC15 and ETH/ETH5 share a symbol.
+    "BTC1H": {"symbol": "BTCUSDT", "tf_sec": 3600, "n": 2, "category": "btc-updown-1h",
+            "order_delay_sec": 30,
+            "ws_stream": "btcusdt@bookTicker",
+            "rest_urls": ["https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=BTCUSDT",
+                          "https://api.binance.us/api/v3/ticker/bookTicker?symbol=BTCUSDT"],
+            "seed_url": "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=12",
+            "fallback_url": "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=12"},
+    "ETH1H": {"symbol": "ETHUSDT", "tf_sec": 3600, "n": 2, "category": "eth-updown-1h",
+            "order_delay_sec": 30,
+            "ws_stream": "ethusdt@bookTicker",
+            "rest_urls": ["https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=ETHUSDT",
+                          "https://api.binance.us/api/v3/ticker/bookTicker?symbol=ETHUSDT"],
+            "seed_url": "https://data-api.binance.vision/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=12",
+            "fallback_url": "https://api.binance.us/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=12"},
 }
 # ETH 15m fill fix (2026-11-16): the ETH 15m orderbook is thin right after
 # a market opens, so a market order placed at the trigger often finds no
@@ -708,11 +738,13 @@ def load_config():
     # A config saved before per-pair toggles existed has no "pairs" key;
     # fill in any missing pair from the DEFAULT_CONFIG values.
     pairs = config.get("pairs") or {}
-    # Migration (v4.6): BTC15 (BTC 15m N=2) was added. The old BTC 5m N=4
-    # is KEPT but turned OFF by default (the user's choice); BTC15 is ON.
+    # Migration (v4.6, updated v4.14): BTC15 (BTC 15m N=2) was added. The old
+    # BTC 5m N=4 is KEPT but turned OFF by default (the user's choice);
+    # BTC15 was ON when added, but the Dec 1 plan (2026-11-17) runs ONLY
+    # the 2 ETH 15m strategies, so BTC15 is OFF by default from v4.14.
     # Runs once: if BTC15 is missing from the saved pairs, this is the
-    # first run with BTC15 support, so turn BTC off and BTC15 on, then save.
-    # The user can turn BTC 5m back on anytime with /btc on.
+    # first run with BTC15 support, so turn BTC off and BTC15 off, then save.
+    # The user can turn BTC 5m / BTC15 back on anytime with /btc on / /btc15 on.
     # NOTE: check BEFORE the setdefault loop below, or it would add BTC15
     # first and the migration would never fire.
     first_btc15 = "BTC15" not in pairs
@@ -720,7 +752,7 @@ def load_config():
         pairs.setdefault(name, DEFAULT_CONFIG["pairs"].get(name, True))
     if first_btc15:
         pairs["BTC"] = False
-        pairs["BTC15"] = True
+        pairs["BTC15"] = False
         config["pairs"] = pairs
         save_config()
     config["pairs"] = pairs
@@ -1077,9 +1109,11 @@ def handle_command(chat_id, text):
         return (f"🤖 Predict.fun DEMO bot\n"
                 f"Fund: ${balance:.2f} (demo)\n"
                 f"BTC 5m: 4 red → UP, 4 green → DOWN (OFF by default)\n"
-                f"BTC15 15m: 2 red → UP, 2 green → DOWN\n"
+                f"BTC15 15m: 2 red → UP, 2 green → DOWN (OFF by default)\n"
                 f"ETH 15m: 2 red → UP, 2 green → DOWN\n"
                 f"ETH5 15m: 5 red → UP, 5 green → DOWN\n"
+                f"BTC1H 1h: 2 red → UP, 2 green → DOWN (OFF by default)\n"
+                f"ETH1H 1h: 2 red → UP, 2 green → DOWN (OFF by default)\n"
                 f"$1 then $2, then STOP. /help")
     if cmd == "/mode":
         if live_running:
@@ -1110,9 +1144,11 @@ def handle_command(chat_id, text):
                 "/setstake 1 2 — trade change\n"
                 "/setminpayout 1.5 — skip a trade if it pays back less than 1.5x (0 = off)\n"
                 "/btc on / /btc off — turn BTC 5m on or off (OFF by default)\n"
-                "/btc15 on / /btc15 off — turn BTC 15m on or off\n"
+                "/btc15 on / /btc15 off — turn BTC 15m on or off (OFF by default)\n"
                 "/eth on / /eth off — turn ETH on or off\n"
                 "/eth5 on / /eth5 off — turn ETH N=5 on or off\n"
+                "/btc1h on / /btc1h off — turn BTC 1h on or off (OFF by default)\n"
+                "/eth1h on / /eth1h off — turn ETH 1h on or off (OFF by default)\n"
                 "/pause on / /pause off — pause new trades 20:00-21:00 Dhaka\n"
                 "/startbot — demo bot start\n/stopbot — demo bot stop")
     if cmd == "/status":
@@ -1136,7 +1172,7 @@ def handle_command(chat_id, text):
                 f"{per}\n"
                 f"Total Win: {total_wins()} | Loss: {total_losses()} | Round: {total_rounds()}\n"
                 f"Balance: ${balance:.2f}")
-    if cmd in ("/btc", "/btc15", "/eth", "/eth5"):
+    if cmd in ("/btc", "/btc15", "/eth", "/eth5", "/btc1h", "/eth1h"):
         name = cmd[1:].upper()
         if not args or args[0].lower() not in ("on", "off"):
             return f"Usage: {cmd} on  or  {cmd} off  (now: {'✅ ON' if pair_enabled(name) else '❌ OFF'})"
@@ -1230,13 +1266,15 @@ def handle_command(chat_id, text):
 
 def bot_loop(chat_id):
     """Paper bot loop: checks candles every 2 sec, notifies on Telegram.
-    Four pairs run independently in this one loop (single thread, so the
+    Six pairs run independently in this one loop (single thread, so the
     shared balance is never updated by two pairs at once):
-      BTC 5m, N=4 reversal (OFF by default). BTC15 15m, N=2 reversal.
+      BTC 5m, N=4 reversal (OFF by default). BTC15 15m, N=2 reversal (OFF).
       ETH 15m, N=2 reversal. ETH5 15m, N=5 reversal.
+      BTC1H 1h, N=2 reversal (OFF by default). ETH1H 1h, N=2 reversal (OFF).
     Each pair has its own state (idle/bet1/bet2/cooldown), its own round
     counter and win/loss stats, and can be turned off/on from Telegram
-    (/btc off, /btc15 off, /eth off, /eth5 off). The fund is shared between the four."""
+    (/btc off, /btc15 off, /eth off, /eth5 off, /btc1h off, /eth1h off).
+    The fund is shared between the six."""
     global balance, running, day_start_balance, bet_active
     api_errors = 0
     current_day = time.strftime("%Y-%m-%d", time.gmtime())  # UTC day, for /pnl
