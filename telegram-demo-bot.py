@@ -98,6 +98,16 @@ Demo PnL is now closer to live (payout filter applied) but still
 assumes every passing order fills — it does not simulate actual fills.
 See _demo_payout_check.
 
+1h SECOND-CHANCE (v4.16, 2026-11-18, Sifat): the 1h pairs (BTC1H/
+ETH1H) get their own second-chance settings, because a 1h candle is
+60 minutes and the 1h book moves further than the 15m book. ROI band
+70%-240% (price ~0.59 to ~0.29) instead of 75%-130%, and up to 8
+tries - one a minute for the first 8 minutes of the hour - instead
+of 2 tries (+60s/+120s). Applies to both normal second chances
+(cancelled order) and min-payout retries (which skip the ROI band, as
+before). 5m/15m pairs are unchanged. See _second_chance_band,
+_second_chance_max_tries and _process_second_chances.
+
 ETH 15m FILL FIX (2026-11-16): the ETH 15m orderbook is thin right
 after a market opens, so a market order placed at the trigger often
 finds no seller and gets CANCELLED (round 1 and round 2 both failed
@@ -291,18 +301,54 @@ SECOND_CHANCE_DELAY_SEC = 60
 SECOND_CHANCE_ROI_MIN = 0.75
 SECOND_CHANCE_ROI_MAX = 1.30
 SECOND_CHANCE_MAX_TRIES = 2
+# 1h pairs (v4.16, 2026-11-18, Sifat): a 1h candle is 60 minutes, so a
+# missed fill has time to be retried for the first 8 minutes of the hour
+# (one try a minute, up to 8 tries), and the ROI band is wider
+# (70%-240%) because the 1h book moves further than the 15m book.
+# ROI 70% is price ~0.59; ROI 240% is price ~0.29.
+SECOND_CHANCE_ROI_MIN_1H = 0.70
+SECOND_CHANCE_ROI_MAX_1H = 2.40
+SECOND_CHANCE_MAX_TRIES_1H = 8
 
 
-def _second_chance_roi_ok(price):
-    """ROI for a price, and whether it is inside the second-chance band.
-    Returns (roi, ok). ROI = (1/price) - 1 is the profit multiple:
-    price 0.50 -> ROI 1.00 (100%, 1:1); price 0.57 -> ROI ~0.75 (75%);
-    price 0.43 -> ROI ~1.30 (130%). Band is [SECOND_CHANCE_ROI_MIN,
-    SECOND_CHANCE_ROI_MAX] (75%-130%). price <= 0 -> (None, False)."""
+def _is_1h_pair(pair):
+    """True for the 1h pairs (BTC1H/ETH1H, tf_sec 3600)."""
+    try:
+        return PAIRS[pair]["tf_sec"] == 3600
+    except Exception:
+        return False
+
+
+def _second_chance_band(pair):
+    """(roi_min, roi_max) for a pair: the 1h band (70%-240%) for 1h
+    pairs, the standard band (75%-130%) for everything else."""
+    if _is_1h_pair(pair):
+        return SECOND_CHANCE_ROI_MIN_1H, SECOND_CHANCE_ROI_MAX_1H
+    return SECOND_CHANCE_ROI_MIN, SECOND_CHANCE_ROI_MAX
+
+
+def _second_chance_max_tries(pair):
+    """How many second-chance tries a pair gets: 8 (first 8 minutes)
+    for 1h pairs, 2 (+60s/+120s) for everything else."""
+    return SECOND_CHANCE_MAX_TRIES_1H if _is_1h_pair(pair) else SECOND_CHANCE_MAX_TRIES
+
+
+def _second_chance_band_label(pair):
+    """'70%-240%' for 1h pairs, '75%-130%' for everything else."""
+    return "70%-240%" if _is_1h_pair(pair) else "75%-130%"
+
+
+def _second_chance_roi_ok(price, pair=None):
+    """ROI for a price, and whether it is inside the pair's second-chance
+    band. Returns (roi, ok). ROI = (1/price) - 1 is the profit multiple:
+    price 0.50 -> ROI 1.00 (100%, 1:1). Standard band 75%-130%
+    (price ~0.57 to ~0.43); 1h band 70%-240% (price ~0.59 to ~0.29).
+    price <= 0 -> (None, False). pair=None uses the standard band."""
     if not price or price <= 0:
         return None, False
     roi = (1.0 / price) - 1.0
-    return roi, SECOND_CHANCE_ROI_MIN <= roi <= SECOND_CHANCE_ROI_MAX
+    lo, hi = _second_chance_band(pair)
+    return roi, lo <= roi <= hi
 
 # Pause hour (Dhaka 20:00-21:00): the 1-year backtest (2026-11-16,
 # backtest-weekday-hour.py) shows this is the ONLY losing hour for
@@ -1469,11 +1515,13 @@ def bot_loop(chat_id):
         """Schedule the next second-chance try for a step whose live order
         ended unfilled. Try 1 is due 60s after the step's FIRST order was
         placed (the first minute's entry did not happen, so the next
-        minute gets another try); try 2 is due 120s after it. Called when
+        minute gets another try); try 2 is due 120s after it. 1h pairs
+        get up to 8 tries (one a minute for the first 8 minutes of the
+        hour - see _second_chance_max_tries). Called when
         an order for the step is cancelled with no retries left - that
         includes a second-chance order that also failed, which is how try
         2 gets scheduled. Nothing is scheduled once the step has used all
-        SECOND_CHANCE_MAX_TRIES tries, or once its round is over (a
+        its tries, or once its round is over (a
         finished round must never start a new try)."""
         key = (p["pair"], p["round"], p["step"])
         ps = pair_state[p["pair"]]
@@ -1487,18 +1535,19 @@ def bot_loop(chat_id):
                                    "dir": p["dir"], "stake": p["stake"],
                                    "market_start": p["market_start"], "tries": 0,
                                    "min_payout_retry": bool(p.get("min_payout_retry"))}
-        elif sc["tries"] < SECOND_CHANCE_MAX_TRIES:
+        elif sc["tries"] < _second_chance_max_tries(p["pair"]):
             sc["due_at"] = base + SECOND_CHANCE_DELAY_SEC * (sc["tries"] + 1)
 
     def _process_second_chances():
         """Fire any second-chance try that is due. For each due step whose
         round is still active and whose market is still open, fetch the
         CURRENT return (ROI) and place the order ONLY if the ROI is inside
-        [SECOND_CHANCE_ROI_MIN, SECOND_CHANCE_ROI_MAX] (75%-130%).
+        the pair's band: 75%-130% normally, 70%-240% for 1h pairs (v4.16).
         Outside the band the entry is stale - that try is skipped (and
         counts as used), and the next try (if any) re-checks the ROI at
-        its own due time. Up to SECOND_CHANCE_MAX_TRIES tries per step;
-        entries are removed once the round is over or the tries are used.
+        its own due time. Up to 2 tries per step normally, up to 8 tries
+        (first 8 minutes) for 1h pairs; entries are removed once the round
+        is over or the tries are used.
         A try that places an order does NOT set its own next due time:
         if that order also fails, the fill-check loop schedules the next
         try through _schedule_second_chance. A try that places NO order
@@ -1509,6 +1558,8 @@ def bot_loop(chat_id):
             pair, rnd, step = key
             ps = pair_state[pair]
             tf_sec = PAIRS[pair]["tf_sec"]
+            max_tries = _second_chance_max_tries(pair)
+            band_label = _second_chance_band_label(pair)
             want_state = "bet1" if step == 1 else "bet2"
             # Clean up first (before the tries/due check) so an entry that
             # used all its tries is removed once its round is over - and
@@ -1516,7 +1567,7 @@ def bot_loop(chat_id):
             if ps["state"] != want_state or ps["round_no"] != rnd or now >= sc["market_start"] + tf_sec:
                 del second_chance[key]
                 continue
-            if sc["tries"] >= SECOND_CHANCE_MAX_TRIES or now < sc["due_at"]:
+            if sc["tries"] >= max_tries or now < sc["due_at"]:
                 continue
             sc["tries"] += 1
             try_no = sc["tries"]
@@ -1526,7 +1577,7 @@ def bot_loop(chat_id):
                 # Next try's due time after a try that placed NO order:
                 # 60s after the previous try's due slot, i.e. first order
                 # + 60s * (tries + 1). Removes the entry when out of tries.
-                if sc["tries"] >= SECOND_CHANCE_MAX_TRIES:
+                if sc["tries"] >= max_tries:
                     second_chance.pop(key, None)
                 else:
                     base = first_placed.get(key, now)
@@ -1535,36 +1586,37 @@ def bot_loop(chat_id):
             try:
                 _m, _o, price, _a, _b, _n = _pf_quote(sc["dir"], sc["stake"], market_start=sc["market_start"], pair=pair)
             except Exception as e:
-                send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{SECOND_CHANCE_MAX_TRIES}): could not read price ({e}).")
+                send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): could not read price ({e}).")
                 _next_due()
                 continue
             # Min-payout retries skip the ROI band: the only filter that
             # blocked the first try was the min payout, so the retry only
             # re-checks that (inside _pf_place_order). Normal second
-            # chances (cancelled orders) still need ROI in 75%-130%.
+            # chances (cancelled orders) still need ROI in the pair's band
+            # (75%-130%, or 70%-240% for 1h pairs).
             roi = None
             if not sc.get("min_payout_retry"):
-                roi, ok = _second_chance_roi_ok(price)
+                roi, ok = _second_chance_roi_ok(price, pair)
                 if roi is None:
-                    send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{SECOND_CHANCE_MAX_TRIES}): bad price.")
+                    send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): bad price.")
                     _next_due()
                     continue
                 if not ok:
-                    send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{SECOND_CHANCE_MAX_TRIES}): return {roi*100:.0f}% outside 75%-130% (price {price:.2f}) - entry stale, no order.")
+                    send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): return {roi*100:.0f}% outside {band_label} (price {price:.2f}) - entry stale, no order.")
                     _next_due()
                     continue
             try:
                 r = _pf_place_order(sc["dir"], sc["stake"], market_start=sc["market_start"], pair=pair)
                 if sc.get("min_payout_retry"):
-                    send(chat_id, f"🔁 Min-payout retry {pair} round {rnd} step {step} (try {try_no}/{SECOND_CHANCE_MAX_TRIES}): payout OK - " + r.get("info", ""))
+                    send(chat_id, f"🔁 Min-payout retry {pair} round {rnd} step {step} (try {try_no}/{max_tries}): payout OK - " + r.get("info", ""))
                 else:
-                    send(chat_id, f"🔁 Second-chance entry {pair} round {rnd} step {step} (try {try_no}/{SECOND_CHANCE_MAX_TRIES}): return {roi*100:.0f}% in 75%-130% - " + r.get("info", ""))
+                    send(chat_id, f"🔁 Second-chance entry {pair} round {rnd} step {step} (try {try_no}/{max_tries}): return {roi*100:.0f}% in {band_label} - " + r.get("info", ""))
                 _track_order(pair, r, step, sc["market_start"])
                 placed = True
             except LowPayoutSkip as e:
-                send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{SECOND_CHANCE_MAX_TRIES}): payout ${e.payout:.2f} on ${e.stake:.0f} ({e.ratio:.2f}x < {e.min_ratio:.2f}x) - too low.")
+                send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): payout ${e.payout:.2f} on ${e.stake:.0f} ({e.ratio:.2f}x < {e.min_ratio:.2f}x) - too low.")
             except Exception as e:
-                send(chat_id, f"⚠️ Second-chance FAILED {pair} round {rnd} step {step} (try {try_no}/{SECOND_CHANCE_MAX_TRIES}): {e}")
+                send(chat_id, f"⚠️ Second-chance FAILED {pair} round {rnd} step {step} (try {try_no}/{max_tries}): {e}")
             if not placed:
                 _next_due()
             else:
@@ -1588,8 +1640,9 @@ def bot_loop(chat_id):
         A LowPayoutSkip (payout below the configured minimum) does NOT
         abandon the round right away (v4.10): the price can improve in
         the next minute, so it schedules a min-payout retry (up to 2
-        tries at +60s/+120s, re-checking ONLY the min payout - the
-        75%-130% ROI band does not apply to a min-payout retry) and the
+        tries at +60s/+120s, or up to 8 tries for 1h pairs - first 8
+        minutes, v4.16 - re-checking ONLY the min payout - the ROI band
+        does not apply to a min-payout retry) and the
         pair stays in bet1/bet2. If every try still finds the payout too
         low, the round settles normally when the candle closes (step 1
         loss only if it filled, else $0)."""
@@ -1608,7 +1661,8 @@ def bot_loop(chat_id):
             # Min-payout retry (v4.10): the payout was too low, but the
             # price can improve in the next minute, so do NOT abandon the
             # round yet. Schedule a min-payout retry (up to 2 tries at
-            # +60s/+120s) that re-checks ONLY the min payout. The pair
+            # +60s/+120s, or up to 8 tries for 1h pairs - first 8 minutes,
+            # v4.16) that re-checks ONLY the min payout. The pair
             # stays in bet1/bet2 so the retry can fire; if every try
             # still finds the payout too low, the round settles normally
             # when the candle closes (step-1 loss only if it filled).
@@ -1888,7 +1942,7 @@ def bot_loop(chat_id):
                     if not _retry_pending(p):
                         _schedule_second_chance(p)
                         why = f" ({reason})" if reason else ""
-                        send(chat_id, f"⚠️ Order {st} {p['pair']} round {p['round']} ${p['stake']:.0f}{why} - NO real trade for this step. Second chance in 60s if return is 75%-130%.")
+                        send(chat_id, f"⚠️ Order {st} {p['pair']} round {p['round']} ${p['stake']:.0f}{why} - NO real trade for this step. Second chance in 60s if return is {_second_chance_band_label(p['pair'])}.")
                 elif st == "OPEN" and age > 60 and not p["warned"]:
                     p["warned"] = True
                     # Do NOT place a second order while the first is still
@@ -1910,7 +1964,8 @@ def bot_loop(chat_id):
             pending[:] = [p for p in pending if not p["done"]]
             # Second-chance retries due this iteration (v4.8): a step whose
             # order ended unfilled gets ONE more try 60s after its first
-            # order, but only if the return is 75%-130% right now.
+            # order, but only if the return is in the pair's band right
+            # now (75%-130%, or 70%-240% for 1h pairs - v4.16).
             _process_second_chances()
             # Each enabled pair runs its own state machine this iteration.
             for name in PAIRS:
