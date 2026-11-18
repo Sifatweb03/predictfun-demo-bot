@@ -180,6 +180,10 @@ DEFAULT_CONFIG = {
     # below this multiple of the stake: 1.5 means $1.50 back on $1,
     # $3.00 back on $2. 0 = no minimum, always place the order.
     "min_payout": 1.5,
+    # Daily PnL history (v4.15, 2026-11-18): {"YYYY-MM-DD": pnl} for the
+    # last 30 UTC days, so /pnl can show 7-day and 30-day PnL. Saved in
+    # this config file (same as /setbalance), pruned to 30 days.
+    "pnl_history": {},
     # No safety system - removed at the user's request (2026-11-16).
     # No daily loss limit, no consecutive-loss stop, no unusual-move stop,
     # no API-fail stop, no $0 stop. The bot keeps trading until stopped.
@@ -685,7 +689,8 @@ def start_feed():
 
 
 def feed_status_line():
-    """One line per pair for /status."""
+    """One line per pair for /feeds (moved out of /status in v4.15 - the
+    user found the 6 feed lines cluttered the status output)."""
     return "\n".join(f.status_line() for f in FEEDS.values())
 
 # ---- state (kept in memory, saved in the config file) ----
@@ -728,6 +733,39 @@ def total_losses():
     return sum(ps["losses"] for ps in pair_state.values())
 
 
+def _pnl_history():
+    """Daily PnL history dict from the config: {"YYYY-MM-DD": pnl}."""
+    h = config.get("pnl_history")
+    if not isinstance(h, dict):
+        h = {}
+        config["pnl_history"] = h
+    return h
+
+
+def _record_day_pnl(date_str, pnl):
+    """Save a finished UTC day's PnL into the history (kept to 30 days)
+    and persist the config. Called on the UTC day rollover."""
+    h = _pnl_history()
+    h[date_str] = round(float(pnl), 2)
+    for d in sorted(h)[:-30]:
+        del h[d]
+    save_config()
+
+
+def _pnl_window(days):
+    """PnL over the last `days` UTC days, including today.
+    Today contributes the live (balance - day_start_balance); earlier
+    days come from the saved history. Days with no record count $0."""
+    today_pnl = balance - day_start_balance
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    total = today_pnl
+    h = _pnl_history()
+    for i in range(1, days):
+        d = (today - datetime.timedelta(days=i)).isoformat()
+        total += h.get(d, 0.0)
+    return total
+
+
 def load_config():
     global config, balance, day_start_balance
     if os.path.exists(CONFIG_FILE):
@@ -756,6 +794,9 @@ def load_config():
         config["pairs"] = pairs
         save_config()
     config["pairs"] = pairs
+    # Daily PnL history (v4.15): make sure it exists on old configs.
+    if not isinstance(config.get("pnl_history"), dict):
+        config["pnl_history"] = {}
     balance = config.get("starting_fund", 10.0)
     day_start_balance = balance
 
@@ -1093,8 +1134,7 @@ def status_text():
                       + (" (paused now - no new trades until 21:00)" if pause_now else ""))
         return ("\n\n".join(lines) +
                 f"\n\nFund: ${balance:.2f} (start ${config['starting_fund']:.2f})\n" +
-                pause_line + "\n" +
-                feed_status_line())
+                pause_line)
     except Exception as e:
         return f"Status check failed: {e}"
 
@@ -1136,7 +1176,8 @@ def handle_command(chat_id, text):
         globals()["live_running"] = False
         return f"Live stopped. PnL: ${balance - day_start_balance:+.2f}"
     if cmd == "/help":
-        return ("/start, /status, /fund, /pnl, /mode\n"
+        return ("/start, /status, /fund, /pnl, /mode, /feeds\n"
+                "/feeds - show each pair's price-feed status (moved out of /status in v4.15)\n"
                 "/livestart - live start (real money, only if LIVE_TRADING=1)\n"
                 "/livestop - live stop\n"
                 "/setfund 20 — fund change\n"
@@ -1153,6 +1194,10 @@ def handle_command(chat_id, text):
                 "/startbot — demo bot start\n/stopbot — demo bot stop")
     if cmd == "/status":
         return status_text()
+    if cmd == "/feeds":
+        # v4.15: feed status moved out of /status (too cluttered) into its
+        # own command. Shows one line per pair: feed source, price, age.
+        return feed_status_line()
     if cmd == "/fund":
         pairs_line = " | ".join(
             f"{name}: {'✅ ON' if pair_enabled(name) else '❌ OFF'}" for name in PAIRS)
@@ -1168,7 +1213,13 @@ def handle_command(chat_id, text):
         per = "\n".join(
             f"{name}: Win {pair_state[name]['wins']} | Loss {pair_state[name]['losses']} | Round {pair_state[name]['round_no']}"
             for name in PAIRS)
+        # v4.15: daily + 7-day + 30-day PnL (the user asked for these in
+        # live mode; shown in both modes - demo is the live rehearsal).
+        # History builds up day by day after this deploy, so the 7-day
+        # and 30-day windows only cover the days since then at first.
         return (f"Today's PnL: ${balance - day_start_balance:+.2f}\n"
+                f"7-day PnL: ${_pnl_window(7):+.2f}\n"
+                f"30-day PnL: ${_pnl_window(30):+.2f}\n"
                 f"{per}\n"
                 f"Total Win: {total_wins()} | Loss: {total_losses()} | Round: {total_rounds()}\n"
                 f"Balance: ${balance:.2f}")
@@ -1782,9 +1833,12 @@ def bot_loop(chat_id):
             continue
         try:
             # New UTC day: /pnl measures "today", not "since the bot
-            # last restarted".
+            # last restarted". Before resetting, record the finished
+            # day's PnL into the history (v4.15) so /pnl can show
+            # 7-day and 30-day PnL.
             today = time.strftime("%Y-%m-%d", time.gmtime())
             if today != current_day:
+                _record_day_pnl(current_day, balance - day_start_balance)
                 current_day = today
                 day_start_balance = balance
                 for ps in pair_state.values():
