@@ -11,5 +11,6 @@
     "ETH1H": false
   },
   "pause_20": true,
-  "min_payout": 1.5
+  "min_payout": 1.5,
+  "pnl_history": {}
 }
