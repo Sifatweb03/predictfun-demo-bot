@@ -1,7 +1,15 @@
 {
-  "starting_fund": 10.0,
+  "starting_fund": 30.0,
   "stake1": 1.0,
   "stake2": 2.0,
-  "daily_loss_limit": 0.0,
-  "max_consecutive_losses": 3
+  "pairs": {
+    "BTC": false,
+    "BTC15": false,
+    "ETH": true,
+    "ETH5": true,
+    "BTC1H": false,
+    "ETH1H": false
+  },
+  "pause_20": true,
+  "min_payout": 1.5
 }
