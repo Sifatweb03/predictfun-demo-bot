@@ -92,9 +92,9 @@ passes counts as filled. The check runs at once in demo mode — no
 deferral (paper mode has no delay; see test-v4-fill-fix.py section 6)
 — so it reads the book as it is at trigger time; a thin book may make
 the payout look low and skip the step, which is the conservative
-direction for a demo. No min-payout retry in demo (live retries at
-+60s/+120s), so demo may skip a few trades live would take on retry.
-Demo PnL is now closer to live (payout filter applied) but still
+direction for a demo. v4.17 ADDS the demo band retry (same band and
+schedule as live), so demo no longer skips trades live would take on
+retry. Demo PnL is now closer to live (payout band applied) but still
 assumes every passing order fills — it does not simulate actual fills.
 See _demo_payout_check.
 
@@ -107,6 +107,25 @@ of 2 tries (+60s/+120s). Applies to both normal second chances
 (cancelled order) and min-payout retries (which skip the ROI band, as
 before). 5m/15m pairs are unchanged. See _second_chance_band,
 _second_chance_max_tries and _process_second_chances.
+
+PAYOUT BAND + RETRY (v4.17, 2026-11-19, Sifat): the old min-payout
+filter (skip when the payout is below min_payout, default 1.5x) is
+replaced by a payout BAND: an order is placed ONLY when the payout
+if it wins is inside the band for its timeframe - 15m pairs
+(BTC/BTC15/ETH/ETH5) 1.7x-2.5x, 1h pairs (BTC1H/ETH1H) 1.8x-3.0x,
+both inclusive. A payout below the band min OR above the band max
+is skipped and retried: 15m retries for the first 3 minutes, one
+check every 30s (6 tries); 1h retries for the first 5 minutes, one
+check every 30s (10 tries). If no check finds the payout in band,
+the round is skipped (step counts $0, pair enters cooldown as a
+min-payout skip does). The band applies to the first placement and
+to every retry, and to both step 1 and step 2. Demo mode applies
+the same band and simulates the retries by re-checking the real
+orderbook at each retry time (no order placed). The old min_payout
+key is kept for backward compatibility (0 = check off) but the band
+takes precedence when present. See _payout_band, _payout_in_band,
+_payout_retry_max_tries and _demo_payout_check. Commands:
+ /setband15m <min> <max> and /setband1h <min> <max>.
 
 ETH 15m FILL FIX (2026-11-16): the ETH 15m orderbook is thin right
 after a market opens, so a market order placed at the trigger often
@@ -163,6 +182,8 @@ import time
 import urllib.parse
 import urllib.request
 
+VERSION = "v4.17"  # payout band + retry (2026-11-19, Sifat)
+
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_PRIV_KEY = os.environ.get("PREDICT_WALLET_PRIVATE_KEY", "")
@@ -189,7 +210,27 @@ DEFAULT_CONFIG = {
     # (no order placed, round abandoned) when the payout if it wins is
     # below this multiple of the stake: 1.5 means $1.50 back on $1,
     # $3.00 back on $2. 0 = no minimum, always place the order.
+    # v4.17: superseded by the payout BAND below (the band takes
+    # precedence when present); kept so an old config still loads, and
+    # 0 still disables the payout check entirely (band included).
     "min_payout": 1.5,
+    # Payout band (v4.17, 2026-11-19, Sifat): an order is placed ONLY
+    # when the payout if it wins is inside the band for its timeframe,
+    # inclusive on both ends. 15m pairs (BTC/BTC15/ETH/ETH5): 1.7x-2.5x.
+    # 1h pairs (BTC1H/ETH1H): 1.8x-3.0x. A payout below the band min OR
+    # above the band max is skipped and retried (see retry keys below).
+    # Change with /setband15m <min> <max> and /setband1h <min> <max>.
+    "payout_band_15m": [1.7, 2.5],
+    "payout_band_1h": [1.8, 3.0],
+    # Payout-band retry (v4.17): when the payout is outside the band at
+    # placement, retry for the first retry_*_seconds, one check every
+    # retry_*_interval seconds. Max tries = seconds // interval:
+    # 15m: 180s / 30s = 6 tries; 1h: 300s / 30s = 10 tries. If no check
+    # finds the payout in band, the round is skipped ($0, cooldown).
+    "retry_15m_seconds": 180,
+    "retry_15m_interval": 30,
+    "retry_1h_seconds": 300,
+    "retry_1h_interval": 30,
     # Daily PnL history (v4.15, 2026-11-18): {"YYYY-MM-DD": pnl} for the
     # last 30 UTC days, so /pnl can show 7-day and 30-day PnL. Saved in
     # this config file (same as /setbalance), pruned to 30 days.
@@ -349,6 +390,109 @@ def _second_chance_roi_ok(price, pair=None):
     roi = (1.0 / price) - 1.0
     lo, hi = _second_chance_band(pair)
     return roi, lo <= roi <= hi
+
+# ---- Payout band (v4.17, 2026-11-19, Sifat) ----
+# An order is placed ONLY when the payout if it wins (payout = stake /
+# price_per_share, so the payout RATIO = payout / stake = 1 / price) is
+# inside the band for the pair's timeframe, inclusive on both ends:
+# 15m pairs 1.7x-2.5x, 1h pairs 1.8x-3.0x. The ratio is independent of
+# the stake (a $1 and a $2 order at the same price have the same ratio),
+# which is why the band is checked on the ratio, not on the payout $.
+# The band takes precedence over the legacy min_payout key; when the
+# band keys are absent (old config) the band falls back to
+# [min_payout, inf). min_payout == 0 disables the check entirely.
+def _payout_band(pair):
+    """(lo, hi) payout band for a pair: 15m [1.7, 2.5], 1h [1.8, 3.0].
+    Falls back to [min_payout, inf) when the band keys are absent."""
+    if _is_1h_pair(pair):
+        band = config.get("payout_band_1h")
+    else:
+        band = config.get("payout_band_15m")
+    if band is not None:
+        try:
+            return float(band[0]), float(band[1])
+        except (TypeError, ValueError, IndexError):
+            pass
+    mp = config.get("min_payout", 1.5)
+    try:
+        mp = float(mp)
+    except (TypeError, ValueError):
+        mp = 1.5
+    return mp, float("inf")
+
+
+def _payout_band_label(pair):
+    """'1.70x-2.50x' for 15m pairs, '1.80x-3.00x' for 1h pairs."""
+    lo, hi = _payout_band(pair)
+    return f"{lo:.2f}x-{hi:.2f}x"
+
+
+def _payout_in_band(price, pair):
+    """Payout ratio for a price, and whether it is inside the pair's
+    payout band. Returns (ratio, ok). ratio = 1 / price (payout/stake):
+    price 0.50 -> ratio 2.00x; price 0.5882 -> ratio 1.70x (15m min);
+    price 0.40 -> ratio 2.50x (15m max); price 0.3333 -> ratio 3.00x
+    (1h max). price <= 0 -> (None, False). Boundaries are INCLUSIVE
+    (double-checked for v4.17: 1.70x and 2.50x place for 15m, 1.69x
+    and 2.51x skip; 1.80x and 3.00x place for 1h, 1.79x and 3.01x skip)."""
+    if not price or price <= 0:
+        return None, False
+    ratio = 1.0 / price
+    lo, hi = _payout_band(pair)
+    return ratio, lo <= ratio <= hi
+
+
+def _payout_check_enabled():
+    """False only when min_payout is explicitly 0 (the old 'off' switch);
+    otherwise the payout band check applies."""
+    try:
+        return float(config.get("min_payout", 1.5)) != 0.0
+    except (TypeError, ValueError):
+        return True
+
+
+def _payout_retry_interval(pair):
+    """Seconds between payout-band retry checks: 30s for both 15m and 1h."""
+    if _is_1h_pair(pair):
+        return int(config.get("retry_1h_interval", 30))
+    return int(config.get("retry_15m_interval", 30))
+
+
+def _payout_retry_window(pair):
+    """Seconds the payout-band retry runs for: 180s (3 min) for 15m,
+    300s (5 min) for 1h."""
+    if _is_1h_pair(pair):
+        return int(config.get("retry_1h_seconds", 300))
+    return int(config.get("retry_15m_seconds", 180))
+
+
+def _payout_retry_max_tries(pair):
+    """Max payout-band retry attempts after the initial placement check:
+    window // interval = 180//30 = 6 for 15m, 300//30 = 10 for 1h.
+    (The initial check at +0s plus these retries cover the window:
+    15m checks at +0s, +30s, ..., +180s; 1h at +0s, +30s, ..., +300s.)"""
+    interval = _payout_retry_interval(pair)
+    if interval <= 0:
+        return 0
+    return max(0, _payout_retry_window(pair) // interval)
+
+
+def _sc_delay_sec(pair, is_band_retry):
+    """Seconds between tries for a retry entry: the payout-band retry
+    interval (30s) for a band retry (min_payout_retry), SECOND_CHANCE_
+    DELAY_SEC (60s) for a normal second-chance (cancelled order).
+    Reads the module global at call time, so tests that monkeypatch
+    SECOND_CHANCE_DELAY_SEC still work."""
+    return _payout_retry_interval(pair) if is_band_retry else SECOND_CHANCE_DELAY_SEC
+
+
+def _sc_max_tries(pair, is_band_retry):
+    """Max tries for a retry entry: 6 (15m) / 10 (1h) for a payout-band
+    retry, _second_chance_max_tries (2 / 8) for a normal second-chance.
+    The tries cap + the interval enforces the retry window: the last
+    band-retry try is due at base + interval * max_tries = base + the
+    window (180s for 15m, 300s for 1h), so no try can fire past it."""
+    return _payout_retry_max_tries(pair) if is_band_retry else _second_chance_max_tries(pair)
 
 # Pause hour (Dhaka 20:00-21:00): the 1-year backtest (2026-11-16,
 # backtest-weekday-hour.py) shows this is the ONLY losing hour for
@@ -910,15 +1054,22 @@ def _pf_jwt():
 
 class LowPayoutSkip(Exception):
     """Raised by _pf_place_order when the payout if the order wins is
-    below the configured minimum (config["min_payout"]). Not an error -
-    the order is deliberately skipped, so the caller must abandon the
-    round (not count it as a failed order)."""
-    def __init__(self, payout, stake, ratio, min_ratio, price):
-        super().__init__(f"payout ${payout:.2f} on ${stake:.0f} ({ratio:.2f}x < {min_ratio:.2f}x)")
+    outside the payout band (v4.17: below the band min or above the band
+    max; before v4.17 it was only below config["min_payout"]). Not an
+    error - the order is deliberately skipped, so the caller must
+    abandon the round (not count it as a failed order) or schedule a
+    payout-band retry. min_ratio is the band low, max_ratio the band
+    high (None = no cap, i.e. the legacy min-only check)."""
+    def __init__(self, payout, stake, ratio, min_ratio, price, max_ratio=None):
+        if max_ratio is not None and ratio > max_ratio:
+            super().__init__(f"payout ${payout:.2f} on ${stake:.0f} ({ratio:.2f}x > {max_ratio:.2f}x)")
+        else:
+            super().__init__(f"payout ${payout:.2f} on ${stake:.0f} ({ratio:.2f}x < {min_ratio:.2f}x)")
         self.payout = payout
         self.stake = stake
         self.ratio = ratio
         self.min_ratio = min_ratio
+        self.max_ratio = max_ratio
         self.price = price
 
 
@@ -1046,17 +1197,21 @@ def _pf_place_order(direction, stake, market_start=None, pair="BTC"):
     from predict_sdk import BuildOrderInput, Side
     market, outcome, price, amounts, builder, nxt = _pf_quote(direction, stake, market_start, pair)
     outcome_name = "Yes" if direction == "UP" else "No"
-    # Minimum payout: if this order wins it pays stake / price_per_share.
-    # Skip the order (raise LowPayoutSkip - the caller abandons the round)
-    # when that payout is below min_payout x the stake. E.g. min 1.5x:
-    # $1 at $0.67/share pays $1.49 -> skip; $1 at $0.50 pays $2.00 -> place.
-    # 0 disables the check. Applies in CHECK mode too (the price is real).
-    min_ratio = config.get("min_payout", 1.5)
-    if min_ratio and min_ratio > 0 and price > 0:
+    # Payout band (v4.17): if this order wins it pays stake / price_per_share.
+    # Skip the order (raise LowPayoutSkip - the caller schedules a retry or
+    # abandons the round) when that payout's RATIO (payout/stake = 1/price)
+    # is outside the band for the pair's timeframe: 15m 1.7x-2.5x, 1h
+    # 1.8x-3.0x, inclusive. E.g. 15m: $1 at $0.59/share pays $1.70 (1.70x,
+    # in band, place); $1 at $0.40 pays $2.50 (2.50x, in band, place); $1 at
+    # $0.67 pays $1.49 (1.49x, below band, skip); $1 at $0.39 pays $2.56
+    # (2.56x, above band, skip). 0 (min_payout == 0) disables the check.
+    # Applies in CHECK mode too (the price is real).
+    if _payout_check_enabled() and price > 0:
         payout = stake / price
         ratio = payout / stake
-        if ratio < min_ratio:
-            raise LowPayoutSkip(payout, stake, ratio, min_ratio, price)
+        lo, hi = _payout_band(pair)
+        if ratio < lo or ratio > hi:
+            raise LowPayoutSkip(payout, stake, ratio, lo, price, max_ratio=hi)
     order_input = BuildOrderInput(side=Side.BUY, token_id=str(outcome["onChainId"]),
         maker_amount=str(amounts.maker_amount), taker_amount=str(amounts.taker_amount),
         fee_rate_bps=str(market.get("feeRateBps", 0)))
@@ -1229,7 +1384,9 @@ def handle_command(chat_id, text):
                 "/setfund 20 — fund change\n"
                 "/setbalance 14.84 — set the balance to any amount\n"
                 "/setstake 1 2 — trade change\n"
-                "/setminpayout 1.5 — skip a trade if it pays back less than 1.5x (0 = off)\n"
+                "/setminpayout 1.5 — set the minimum payout (band low) for all pairs (0 = off)\n"
+                "/setband15m 1.7 2.5 — payout band for 15m pairs (order only inside it)\n"
+                "/setband1h 1.8 3.0 — payout band for 1h pairs\n"
                 "/btc on / /btc off — turn BTC 5m on or off (OFF by default)\n"
                 "/btc15 on / /btc15 off — turn BTC 15m on or off (OFF by default)\n"
                 "/eth on / /eth off — turn ETH on or off\n"
@@ -1249,11 +1406,16 @@ def handle_command(chat_id, text):
             f"{name}: {'✅ ON' if pair_enabled(name) else '❌ OFF'}" for name in PAIRS)
         mp = config.get("min_payout", 1.5)
         mp_line = f"Min payout: {mp:.2f}x" if mp else "Min payout: OFF"
+        band15 = _payout_band("ETH")
+        band1h = _payout_band("ETH1H")
+        band_line = (f"Payout band 15m: {band15[0]:.2f}x-{band15[1]:.2f}x | "
+                     f"1h: {band1h[0]:.2f}x-{band1h[1]:.2f}x")
         return (f"Starting fund: ${config['starting_fund']:.2f}\n"
                 f"Balance now: ${balance:.2f}\n"
                 f"PnL: ${balance - config['starting_fund']:+.2f}\n"
                 f"Stake: ${config['stake1']:.0f} / ${config['stake2']:.0f}\n"
                 f"{mp_line}\n"
+                f"{band_line}\n"
                 f"Pairs: {pairs_line}")
     if cmd == "/pnl":
         per = "\n".join(
@@ -1345,11 +1507,38 @@ def handle_command(chat_id, text):
             save_config()
             if v == 0:
                 return "✅ Min payout OFF - every order is placed."
+            # v4.17: the payout band controls placement now, so setting
+            # the minimum also moves both band lows to v (highs kept).
+            for key in ("payout_band_15m", "payout_band_1h"):
+                band = config.get(key)
+                if band is not None:
+                    try:
+                        config[key] = [v, float(band[1])]
+                    except (TypeError, ValueError, IndexError):
+                        pass
+            save_config()
             return (f"✅ Min payout set: {v:.2f}x "
                     f"(a ${config['stake1']:.0f} trade needs ${config['stake1'] * v:.2f} back, "
-                    f"${config['stake2']:.0f} needs ${config['stake2'] * v:.2f}).")
+                    f"${config['stake2']:.0f} needs ${config['stake2'] * v:.2f}). "
+                    f"Band lows updated to {v:.2f}x.")
         except Exception:
             return "Usage: /setminpayout 1.5  (0 = no minimum)"
+    if cmd in ("/setband15m", "/setband1h"):
+        # v4.17: set the payout band for a timeframe. 15m pairs place an
+        # order only when the payout is inside the band (inclusive);
+        # 1h pairs likewise. The band is saved, so it survives a redeploy.
+        key = "payout_band_15m" if cmd == "/setband15m" else "payout_band_1h"
+        label = "15m" if cmd == "/setband15m" else "1h"
+        try:
+            lo = float(args[0])
+            hi = float(args[1])
+            if not (0 < lo < hi <= 10):
+                return f"Band must be 0 < min < max <= 10. Example: {cmd} 1.7 2.5"
+            config[key] = [lo, hi]
+            save_config()
+            return f"✅ Payout band {label} set: {lo:.2f}x-{hi:.2f}x (order only inside it)."
+        except Exception:
+            return f"Usage: {cmd} <min> <max>  (example: {cmd} 1.7 2.5)"
     if cmd == "/startbot":
         if running:
             return "Bot is already running."
@@ -1513,30 +1702,38 @@ def bot_loop(chat_id):
 
     def _schedule_second_chance(p):
         """Schedule the next second-chance try for a step whose live order
-        ended unfilled. Try 1 is due 60s after the step's FIRST order was
-        placed (the first minute's entry did not happen, so the next
-        minute gets another try); try 2 is due 120s after it. 1h pairs
-        get up to 8 tries (one a minute for the first 8 minutes of the
-        hour - see _second_chance_max_tries). Called when
-        an order for the step is cancelled with no retries left - that
-        includes a second-chance order that also failed, which is how try
-        2 gets scheduled. Nothing is scheduled once the step has used all
-        its tries, or once its round is over (a
-        finished round must never start a new try)."""
+        ended unfilled, or whose payout was outside the band. For a
+        normal second-chance (cancelled order) try 1 is due 60s after the
+        step's FIRST order was placed and try 2 is due 120s after it
+        (1h pairs: up to 8 tries, one a minute - see
+        _second_chance_max_tries). For a payout-band retry
+        (min_payout_retry) the tries use the payout-band schedule
+        instead: one check every 30s for the first 3 minutes (15m, 6
+        tries) or the first 5 minutes (1h, 10 tries) - see
+        _sc_delay_sec / _sc_max_tries. Called when an order for the
+        step is cancelled with no retries left - that includes a
+        second-chance order that also failed, which is how try 2 gets
+        scheduled. Nothing is scheduled once the step has used all its
+        tries, or once its round is over (a finished round must never
+        start a new try)."""
         key = (p["pair"], p["round"], p["step"])
         ps = pair_state[p["pair"]]
         want_state = "bet1" if p["step"] == 1 else "bet2"
         if ps["state"] != want_state or ps["round_no"] != p["round"]:
             return
+        is_band = bool(p.get("min_payout_retry"))
+        delay = _sc_delay_sec(p["pair"], is_band)
+        max_tries = _sc_max_tries(p["pair"], is_band)
         base = first_placed.get(key, p.get("placed", time.time()))
         sc = second_chance.get(key)
         if sc is None:
-            second_chance[key] = {"due_at": base + SECOND_CHANCE_DELAY_SEC,
+            second_chance[key] = {"due_at": base + delay,
                                    "dir": p["dir"], "stake": p["stake"],
                                    "market_start": p["market_start"], "tries": 0,
-                                   "min_payout_retry": bool(p.get("min_payout_retry"))}
-        elif sc["tries"] < _second_chance_max_tries(p["pair"]):
-            sc["due_at"] = base + SECOND_CHANCE_DELAY_SEC * (sc["tries"] + 1)
+                                   "min_payout_retry": is_band,
+                                   "demo": bool(p.get("demo"))}
+        elif sc["tries"] < max_tries:
+            sc["due_at"] = base + delay * (sc["tries"] + 1)
 
     def _process_second_chances():
         """Fire any second-chance try that is due. For each due step whose
@@ -1548,17 +1745,28 @@ def bot_loop(chat_id):
         its own due time. Up to 2 tries per step normally, up to 8 tries
         (first 8 minutes) for 1h pairs; entries are removed once the round
         is over or the tries are used.
+        Payout-band retries (v4.17, min_payout_retry): the only filter
+        that blocked the first try was the payout band, so the retry only
+        re-checks the band (inside _pf_place_order) - the ROI band does
+        NOT apply. They use the payout-band schedule instead: one check
+        every 30s for the first 3 minutes (15m, 6 tries) or the first
+        5 minutes (1h, 10 tries). A demo band retry (demo=True) re-runs
+        _demo_payout_check instead of placing an order.
         A try that places an order does NOT set its own next due time:
         if that order also fails, the fill-check loop schedules the next
         try through _schedule_second_chance. A try that places NO order
         (skipped for a bad return, or the quote/place failed) sets the
-        next try's due time itself, so it is re-checked 60s later."""
+        next try's due time itself, so it is re-checked at the next
+        interval."""
         now = time.time()
         for key, sc in list(second_chance.items()):
             pair, rnd, step = key
             ps = pair_state[pair]
             tf_sec = PAIRS[pair]["tf_sec"]
-            max_tries = _second_chance_max_tries(pair)
+            is_band = bool(sc.get("min_payout_retry"))
+            is_demo = bool(sc.get("demo"))
+            max_tries = _sc_max_tries(pair, is_band)
+            delay = _sc_delay_sec(pair, is_band)
             band_label = _second_chance_band_label(pair)
             want_state = "bet1" if step == 1 else "bet2"
             # Clean up first (before the tries/due check) so an entry that
@@ -1571,31 +1779,62 @@ def bot_loop(chat_id):
                 continue
             sc["tries"] += 1
             try_no = sc["tries"]
-            placed = False
+            did_place = False
 
             def _next_due():
                 # Next try's due time after a try that placed NO order:
-                # 60s after the previous try's due slot, i.e. first order
-                # + 60s * (tries + 1). Removes the entry when out of tries.
+                # one interval after the previous try's due slot, i.e.
+                # first order + interval * (tries + 1). Removes the entry
+                # when out of tries. The interval + tries cap enforces
+                # the retry window (15m: 30s x 6 = 180s; 1h: 30s x 10
+                # = 300s), so no try can fire past it.
                 if sc["tries"] >= max_tries:
                     second_chance.pop(key, None)
                 else:
                     base = first_placed.get(key, now)
-                    sc["due_at"] = base + SECOND_CHANCE_DELAY_SEC * (sc["tries"] + 1)
+                    sc["due_at"] = base + delay * (sc["tries"] + 1)
 
+            # Demo band retry (v4.17): re-check the real orderbook band
+            # (no order placed, no SKIP spam - only the first check
+            # announces the skip). The band check is done inline here
+            # (not via _demo_payout_check, which sends a SKIP message
+            # on every failure). A retry that finds the payout in band
+            # flips `placed` to True (the step counts as filled); if
+            # all retries fail, False (recorded by the first check)
+            # stays and the step counts $0.
+            if is_demo:
+                try:
+                    _m, _o, dprice, _a, _b, _n = _pf_quote(sc["dir"], sc["stake"], market_start=sc["market_start"], pair=pair)
+                except Exception:
+                    if sc["tries"] >= max_tries:
+                        second_chance.pop(key, None)
+                    else:
+                        _next_due()
+                    continue
+                dratio, dok = _payout_in_band(dprice, pair)
+                if dok:
+                    placed[(pair, rnd, step)] = True
+                    send(chat_id, f"🔁 Demo band retry {pair} round {rnd} step {step} (try {try_no}/{max_tries}): payout {dratio:.2f}x in band {_payout_band_label(pair)} - step counts as filled.")
+                    second_chance.pop(key, None)
+                elif sc["tries"] >= max_tries:
+                    send(chat_id, f"⏭️ Demo band retry {pair} round {rnd} step {step}: payout still outside band {_payout_band_label(pair)} after {max_tries} tries - step skipped ($0).")
+                    second_chance.pop(key, None)
+                else:
+                    _next_due()
+                continue
             try:
                 _m, _o, price, _a, _b, _n = _pf_quote(sc["dir"], sc["stake"], market_start=sc["market_start"], pair=pair)
             except Exception as e:
                 send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): could not read price ({e}).")
                 _next_due()
                 continue
-            # Min-payout retries skip the ROI band: the only filter that
-            # blocked the first try was the min payout, so the retry only
-            # re-checks that (inside _pf_place_order). Normal second
-            # chances (cancelled orders) still need ROI in the pair's band
-            # (75%-130%, or 70%-240% for 1h pairs).
+            # Min-payout (band) retries skip the ROI band: the only
+            # filter that blocked the first try was the payout band, so
+            # the retry only re-checks that (inside _pf_place_order).
+            # Normal second chances (cancelled orders) still need ROI
+            # in the pair's band (75%-130%, or 70%-240% for 1h pairs).
             roi = None
-            if not sc.get("min_payout_retry"):
+            if not is_band:
                 roi, ok = _second_chance_roi_ok(price, pair)
                 if roi is None:
                     send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): bad price.")
@@ -1607,17 +1846,21 @@ def bot_loop(chat_id):
                     continue
             try:
                 r = _pf_place_order(sc["dir"], sc["stake"], market_start=sc["market_start"], pair=pair)
-                if sc.get("min_payout_retry"):
+                if is_band:
                     send(chat_id, f"🔁 Min-payout retry {pair} round {rnd} step {step} (try {try_no}/{max_tries}): payout OK - " + r.get("info", ""))
                 else:
                     send(chat_id, f"🔁 Second-chance entry {pair} round {rnd} step {step} (try {try_no}/{max_tries}): return {roi*100:.0f}% in {band_label} - " + r.get("info", ""))
                 _track_order(pair, r, step, sc["market_start"])
-                placed = True
+                did_place = True
             except LowPayoutSkip as e:
-                send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): payout ${e.payout:.2f} on ${e.stake:.0f} ({e.ratio:.2f}x < {e.min_ratio:.2f}x) - too low.")
+                if e.max_ratio is not None and e.ratio > e.max_ratio:
+                    why = f"{e.ratio:.2f}x > {e.max_ratio:.2f}x"
+                else:
+                    why = f"{e.ratio:.2f}x < {e.min_ratio:.2f}x"
+                send(chat_id, f"⏭️ Second-chance SKIP {pair} round {rnd} step {step} (try {try_no}/{max_tries}): payout ${e.payout:.2f} on ${e.stake:.0f} ({why}) - outside band {_payout_band_label(pair)}.")
             except Exception as e:
                 send(chat_id, f"⚠️ Second-chance FAILED {pair} round {rnd} step {step} (try {try_no}/{max_tries}): {e}")
-            if not placed:
+            if not did_place:
                 _next_due()
             else:
                 # Order placed. Park the due time far in the future so the
@@ -1637,15 +1880,15 @@ def bot_loop(chat_id):
         order_placed=True. Only called when live_running is on.
         Reads bet_open once and bails out if a toggle cleared it to None
         in the meantime - the round is already dropped then.
-        A LowPayoutSkip (payout below the configured minimum) does NOT
-        abandon the round right away (v4.10): the price can improve in
-        the next minute, so it schedules a min-payout retry (up to 2
-        tries at +60s/+120s, or up to 8 tries for 1h pairs - first 8
-        minutes, v4.16 - re-checking ONLY the min payout - the ROI band
-        does not apply to a min-payout retry) and the
-        pair stays in bet1/bet2. If every try still finds the payout too
-        low, the round settles normally when the candle closes (step 1
-        loss only if it filled, else $0)."""
+        A LowPayoutSkip (payout outside the band) does NOT abandon the
+        round right away (v4.10, band v4.17): the price can improve, so
+        it schedules a payout-band retry (15m: 6 tries, one every 30s
+        for the first 3 minutes; 1h: 10 tries, one every 30s for the
+        first 5 minutes - re-checking ONLY the band; the ROI band does
+        not apply to a band retry) and the pair stays in bet1/bet2. If
+        every try still finds the payout outside the band, the round
+        settles normally when the candle closes (step 1 loss only if it
+        filled, else $0)."""
         global balance
         ps = pair_state[pair]
         step = 1 if ps["state"] == "bet1" else 2
@@ -1658,14 +1901,15 @@ def bot_loop(chat_id):
             send(chat_id, ("CHECK (no order sent): " if r.get("check_only") else "LIVE ORDER SENT: ") + r.get("info", ""))
             _track_order(pair, r, step, bet_open // 1000)
         except LowPayoutSkip as e:
-            # Min-payout retry (v4.10): the payout was too low, but the
-            # price can improve in the next minute, so do NOT abandon the
-            # round yet. Schedule a min-payout retry (up to 2 tries at
-            # +60s/+120s, or up to 8 tries for 1h pairs - first 8 minutes,
-            # v4.16) that re-checks ONLY the min payout. The pair
-            # stays in bet1/bet2 so the retry can fire; if every try
-            # still finds the payout too low, the round settles normally
-            # when the candle closes (step-1 loss only if it filled).
+            # Payout-band retry (v4.17, was min-payout retry v4.10): the
+            # payout was outside the band, but the price can improve, so
+            # do NOT abandon the round yet. Schedule a band retry (15m:
+            # 6 tries, one every 30s for the first 3 minutes; 1h: 10
+            # tries, one every 30s for the first 5 minutes) that
+            # re-checks ONLY the band. The pair stays in bet1/bet2 so the
+            # retry can fire; if every try still finds the payout
+            # outside the band, the round settles normally when the
+            # candle closes (step-1 loss only if it filled).
             # first_placed is set here (no order was ever placed) so the
             # retry due times are anchored to this first attempt.
             key = (pair, ps["round_no"], step)
@@ -1675,21 +1919,34 @@ def bot_loop(chat_id):
                                      "dir": ps["bet_dir"], "stake": ps["bet_stake"],
                                      "market_start": bet_open // 1000, "placed": time.time(),
                                      "min_payout_retry": True})
-            send(chat_id, f"⏭️ SKIP {pair} round {ps['round_no']} step {step}: payout ${e.payout:.2f} on ${e.stake:.0f} ({e.ratio:.2f}x < {e.min_ratio:.2f}x) - too low. Will retry in 60s if payout improves above {e.min_ratio:.2f}x.")
+            if e.max_ratio is not None and e.ratio > e.max_ratio:
+                why = f"{e.ratio:.2f}x > {e.max_ratio:.2f}x"
+            else:
+                why = f"{e.ratio:.2f}x < {e.min_ratio:.2f}x"
+            send(chat_id, f"⏭️ SKIP {pair} round {ps['round_no']} step {step}: payout ${e.payout:.2f} on ${e.stake:.0f} ({why}) - outside band {_payout_band_label(pair)}. Will retry {_payout_retry_max_tries(pair)}x every {_payout_retry_interval(pair)}s if payout returns in band.")
         except Exception as e:
             send(chat_id, f"Live order FAILED {pair} round {ps['round_no']}: {e}")
 
     def _demo_payout_check(pair):
-        """Demo mode (v4.13): read the REAL orderbook for the current step
-        and apply the min-payout filter, exactly like live mode does —
-        but place NO order, build nothing, sign nothing, send nothing.
-        Returns True if the paper step passes (recorded in `placed` as
-        True, counts as filled) or False if the payout is too low
-        (recorded as False, counts $0 at settlement). On any orderbook
-        read failure, records True (old demo behavior) so a feed hiccup
-        can't zero out paper wins. No min-payout retry in demo (v4.13):
-        a skipped step just counts $0; live retries at +60s/+120s, so
-        demo may skip a few trades live would take on retry."""
+        """Demo mode (v4.13, band v4.17): read the REAL orderbook for the
+        current step and apply the payout BAND, exactly like live mode
+        does — but place NO order, build nothing, sign nothing, send
+        nothing. Returns True if the paper step passes (recorded in
+        `placed` as True, counts as filled) or False if the payout is
+        outside the band (recorded as False, counts $0 at settlement).
+        On any orderbook read failure, records True (old demo behavior)
+        so a feed hiccup can't zero out paper wins. A False return
+        schedules a demo band retry (the CALLER does that - see
+        _schedule_order and the deferred-order branch in _pair_step):
+        the retry re-checks the book at each retry time and flips
+        `placed` to True if the payout comes back in band, so demo no
+        longer skips trades live would take on retry.
+        NOTE: the band is computed inline here (not via _payout_band) so
+        this function stays self-contained for the AST-based v4.13 test,
+        which execs it with only pair_state/config/placed/send/chat_id/
+        _pf_quote in scope. It mirrors _payout_band exactly: 1h pairs
+        (BTC1H/ETH1H) use payout_band_1h, everything else
+        payout_band_15m; min_payout == 0 disables the check."""
         ps = pair_state[pair]
         step = 1 if ps["state"] == "bet1" else 2
         bet_open = ps["bet_open"]
@@ -1703,16 +1960,52 @@ def bot_loop(chat_id):
             print(f"[demo payout check {pair}] quote failed: {e}", flush=True)
             placed[(pair, ps["round_no"], step)] = True
             return True
-        min_ratio = config.get("min_payout", 1.5)
-        if min_ratio and min_ratio > 0 and price and price > 0:
+        # Payout band, inline (mirrors _payout_band; see the NOTE above).
+        try:
+            if float(config.get("min_payout", 1.5)) == 0.0:
+                placed[(pair, ps["round_no"], step)] = True
+                return True
+        except (TypeError, ValueError):
+            pass
+        if pair in ("BTC1H", "ETH1H"):
+            band = config.get("payout_band_1h", [1.8, 3.0])
+        else:
+            band = config.get("payout_band_15m", [1.7, 2.5])
+        try:
+            lo, hi = float(band[0]), float(band[1])
+        except (TypeError, ValueError, IndexError):
+            lo, hi = 1.7, 2.5
+        if price and price > 0:
             payout = ps["bet_stake"] / price
             ratio = payout / ps["bet_stake"]
-            if ratio < min_ratio:
+            if ratio < lo or ratio > hi:
                 placed[(pair, ps["round_no"], step)] = False
-                send(chat_id, f"⏭️ SKIP {pair} round {ps['round_no']} step {step}: payout ${payout:.2f} on ${ps['bet_stake']:.0f} ({ratio:.2f}x < {min_ratio:.2f}x) - too low (demo, real book).")
+                if ratio > hi:
+                    why = f"{ratio:.2f}x > {hi:.2f}x"
+                else:
+                    why = f"{ratio:.2f}x < {lo:.2f}x"
+                send(chat_id, f"⏭️ SKIP {pair} round {ps['round_no']} step {step}: payout ${payout:.2f} on ${ps['bet_stake']:.0f} ({why}) - outside band {lo:.2f}x-{hi:.2f}x (demo, real book). Will retry if payout returns in band.")
                 return False
         placed[(pair, ps["round_no"], step)] = True
         return True
+
+    def _schedule_demo_band_retry(pair):
+        """Demo mode (v4.17): after a demo payout check found the payout
+        outside the band, schedule a demo band retry (re-checks the real
+        orderbook at each retry time). The retry entry is processed by
+        _process_second_chances with demo=True; it never places an order."""
+        ps = pair_state[pair]
+        step = 1 if ps["state"] == "bet1" else 2
+        bet_open = ps["bet_open"]
+        if bet_open is None:
+            return
+        key = (pair, ps["round_no"], step)
+        if key not in first_placed:
+            first_placed[key] = time.time()
+        _schedule_second_chance({"pair": pair, "round": ps["round_no"], "step": step,
+                                 "dir": ps["bet_dir"], "stake": ps["bet_stake"],
+                                 "market_start": bet_open // 1000, "placed": time.time(),
+                                 "min_payout_retry": True, "demo": True})
 
     def _schedule_order(pair):
         """Decide when the current step's LIVE order goes out. If the pair
@@ -1723,7 +2016,9 @@ def bot_loop(chat_id):
         rule (see test-v4-fill-fix.py section 6: paper mode has no delay).
         The check reads the book as it is at trigger time; a thin book
         may make the payout look low and skip the step, which is the
-        conservative direction for a demo."""
+        conservative direction for a demo. v4.17: a failed demo check
+        schedules a demo band retry (re-checks the book at each retry
+        time), so demo no longer skips trades live would take on retry."""
         ps = pair_state[pair]
         delay = PAIRS[pair].get("order_delay_sec", 0)
         if live_running and delay > 0:
@@ -1733,7 +2028,8 @@ def bot_loop(chat_id):
             if live_running:
                 _place_current_step(pair)
             else:
-                _demo_payout_check(pair)
+                if not _demo_payout_check(pair):
+                    _schedule_demo_band_retry(pair)
                 ps["order_placed"] = True
 
     def _pair_step(pair):
@@ -1772,7 +2068,8 @@ def bot_loop(chat_id):
             if live_running:
                 _place_current_step(pair)
             else:
-                _demo_payout_check(pair)
+                if not _demo_payout_check(pair):
+                    _schedule_demo_band_retry(pair)
                 ps["order_placed"] = True
         if ps["state"] in ("bet1", "bet2") and bet_open is not None:
             done = [k for k in closed if int(k[0]) == bet_open]
@@ -1996,7 +2293,7 @@ def main():
         print("ERROR: Set TELEGRAM_BOT_TOKEN.\n"
               "TELEGRAM_BOT_TOKEN=xxxx python3 telegram-demo-bot.py")
         return
-    print(f"Demo bot running. Starting fund ${config['starting_fund']:.2f} (demo only, no real money)")
+    print(f"Demo bot {VERSION} running. Starting fund ${config['starting_fund']:.2f} (demo only, no real money)")
     offset = 0
     loop_thread = None
     while True:
