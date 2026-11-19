@@ -127,6 +127,22 @@ takes precedence when present. See _payout_band, _payout_in_band,
 _payout_retry_max_tries and _demo_payout_check. Commands:
  /setband15m <min> <max> and /setband1h <min> <max>.
 
+RETURN-BASED PnL (v4.18, 2026-11-19, Sifat): a win no longer credits
+a flat $1. The payout ratio (payout/stake = 1/price) of the order
+that filled the step is recorded at fill time - live from
+_pf_place_order/_pf_quote, demo from _demo_payout_check (which
+already reads the real orderbook) - and settlement credits the
+ACTUAL return: step-1 win pays stake1 * (ratio1 - 1) (e.g. filled at
+1.7x -> +$0.70, at 2.5x -> +$1.50); step-2 win nets -stake1 +
+stake2 * (ratio2 - 1) (e.g. step 2 at 2.0x -> -$1.00 + $2.00 =
++$1.00). A step that never filled still moves $0, and a loss still
+costs the stake (the payout only matters for wins). If the fill
+payout was never recorded (quote failed, or an order placed before
+v4.18), the win falls back to the flat stake (old behaviour). WIN
+messages show the payout used (e.g. "+$0.70 @1.70x"). Applies to
+both demo and live (shared settlement code). See fill_ratio,
+_step_payout_ratio and _win_profit.
+
 ETH 15m FILL FIX (2026-11-16): the ETH 15m orderbook is thin right
 after a market opens, so a market order placed at the trigger often
 finds no seller and gets CANCELLED (round 1 and round 2 both failed
@@ -182,7 +198,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v4.17"  # payout band + retry (2026-11-19, Sifat)
+VERSION = "v4.18"  # return-based PnL (2026-11-19, Sifat)
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
@@ -1599,6 +1615,17 @@ def bot_loop(chat_id):
     # a skipped step as filled and a min-payout retry round could credit
     # a win that never risked money.
     placed = {}
+    # (pair, round, step) -> payout ratio (payout/stake = 1/price) of the
+    # order that filled the step (v4.18, return-based PnL). Live: recorded
+    # at placement in _track_order / _retry_pending from the placed
+    # order's price (the most recent order for the step wins, so a
+    # cancelled order's ratio is overwritten by its replacement).
+    # Demo: recorded in _demo_payout_check / the demo band retry from the
+    # real orderbook quote. Settlement credits the ACTUAL return on a
+    # win (stake * (ratio - 1)) instead of a flat $1. Absent (quote
+    # failed, check disabled, or an order placed before v4.18) -> the
+    # win falls back to the flat stake. An unfilled step never reads it.
+    fill_ratio = {}
 
     def _step_filled(pair, rnd, step):
         """Did this pair-round-step's live order actually fill? True/False,
@@ -1654,6 +1681,32 @@ def bot_loop(chat_id):
             return filled[key]
         return False  # no order was ever tracked for this step
 
+    def _step_payout_ratio(pair, rnd, step):
+        """Payout ratio (payout/stake = 1/price) of the order that filled
+        this step, or None if it was never recorded. Live: recorded at
+        placement time (_track_order / _retry_pending). Demo: recorded by
+        _demo_payout_check / the demo band retry. None means the win
+        falls back to the flat stake (old behaviour) - a quote failure
+        or an order placed before v4.18 must not zero out a real win."""
+        try:
+            r = float(fill_ratio.get((pair, rnd, step)))
+        except (TypeError, ValueError):
+            return None
+        return r if r > 0 else None
+
+    def _win_profit(filled_flag, ratio, stake):
+        """Profit if this step's trade wins. With the fill payout ratio
+        known (v4.18): stake * (ratio - 1) - the ACTUAL return, e.g.
+        $1 at 1.7x -> +$0.70, $2 at 2.0x -> +$2.00. Without a ratio:
+        the flat stake (old behaviour). A step that never filled (or
+        whose fill is unknown) pays $0. A loss is NOT computed here -
+        a losing step always costs its full stake, whatever the payout."""
+        if filled_flag is not True:
+            return 0.0
+        if ratio is None or ratio <= 0:
+            return float(stake)
+        return float(stake) * (ratio - 1.0)
+
     def _retry_pending(p):
         """One retry for a pending order that did not fill. Only while its
         pair's round is still active and its market is still open. Up to
@@ -1669,6 +1722,14 @@ def bot_loop(chat_id):
         p["retries"] = p.get("retries", 0) + 1
         try:
             r2 = _pf_place_order(p["dir"], p["stake"], market_start=p["market_start"], pair=pair)
+            # v4.18: record this retry's fill payout (its own price, not
+            # the cancelled order's) so a win credits the retry's return.
+            try:
+                _rp = float(r2.get("price")) if r2.get("price") else 0.0
+                if _rp > 0:
+                    fill_ratio[(pair, p["round"], p["step"])] = 1.0 / _rp
+            except (TypeError, ValueError):
+                pass
             send(chat_id, "🔄 Retrying order %s round %d (try %d/%d): %s" % (pair, p["round"], p["retries"], ORDER_MAX_RETRIES, r2.get("info", "")))
             if not r2.get("check_only"):
                 pending.append({"hash": r2["order_hash"], "pair": pair, "round": p["round"], "step": p["step"],
@@ -1692,6 +1753,18 @@ def bot_loop(chat_id):
         # so a skipped step (min-payout) counts $0, not a paper win.
         if r and r.get("order_hash"):
             placed[(pair, ps["round_no"], step)] = True
+        # v4.18: record this order's fill payout ratio (1/price) so a
+        # win credits the ACTUAL return. The most recent order for the
+        # step wins: a second-chance order overwrites a cancelled one's
+        # ratio. An order that never fills is never read at settlement,
+        # so recording at placement time is safe.
+        if r and r.get("price"):
+            try:
+                _tp = float(r["price"])
+                if _tp > 0:
+                    fill_ratio[(pair, ps["round_no"], step)] = 1.0 / _tp
+            except (TypeError, ValueError):
+                pass
         if live_running and r and not r.get("check_only") and r.get("order_hash"):
             key = (pair, ps["round_no"], step)
             if key not in first_placed:
@@ -1813,6 +1886,9 @@ def bot_loop(chat_id):
                     continue
                 dratio, dok = _payout_in_band(dprice, pair)
                 if dok:
+                    # v4.18: record the retry's fill payout so the win
+                    # credits this retry's return, not the first check's.
+                    fill_ratio[(pair, rnd, step)] = dratio
                     placed[(pair, rnd, step)] = True
                     send(chat_id, f"🔁 Demo band retry {pair} round {rnd} step {step} (try {try_no}/{max_tries}): payout {dratio:.2f}x in band {_payout_band_label(pair)} - step counts as filled.")
                     second_chance.pop(key, None)
@@ -1943,10 +2019,14 @@ def bot_loop(chat_id):
         longer skips trades live would take on retry.
         NOTE: the band is computed inline here (not via _payout_band) so
         this function stays self-contained for the AST-based v4.13 test,
-        which execs it with only pair_state/config/placed/send/chat_id/
-        _pf_quote in scope. It mirrors _payout_band exactly: 1h pairs
-        (BTC1H/ETH1H) use payout_band_1h, everything else
-        payout_band_15m; min_payout == 0 disables the check."""
+        which execs it with only pair_state/config/placed/fill_ratio/
+        send/chat_id/_pf_quote in scope. It mirrors _payout_band exactly:
+        1h pairs (BTC1H/ETH1H) use payout_band_1h, everything else
+        payout_band_15m; min_payout == 0 disables the check.
+        v4.18: on a pass, the fill payout ratio is recorded in
+        fill_ratio so a win credits the ACTUAL return. On a quote
+        failure or a disabled check there is no price, so nothing is
+        recorded and a win falls back to the flat stake."""
         ps = pair_state[pair]
         step = 1 if ps["state"] == "bet1" else 2
         bet_open = ps["bet_open"]
@@ -1986,6 +2066,8 @@ def bot_loop(chat_id):
                     why = f"{ratio:.2f}x < {lo:.2f}x"
                 send(chat_id, f"⏭️ SKIP {pair} round {ps['round_no']} step {step}: payout ${payout:.2f} on ${ps['bet_stake']:.0f} ({why}) - outside band {lo:.2f}x-{hi:.2f}x (demo, real book). Will retry if payout returns in band.")
                 return False
+            # v4.18: record the fill payout ratio for settlement.
+            fill_ratio[(pair, ps["round_no"], step)] = ratio
         placed[(pair, ps["round_no"], step)] = True
         return True
 
@@ -2084,21 +2166,29 @@ def bot_loop(chat_id):
                 res = colour(done[0])
                 if res == ps["win_col"]:
                     if ps["state"] == "bet1":
-                        # Step-1 win: +stake1 only if its order really
-                        # filled, else $0 (paper-only win).
+                        # Step-1 win: the ACTUAL return (v4.18), not a
+                        # flat $1 - stake1 * (ratio1 - 1) when the fill
+                        # payout is known, else the flat stake (fallback).
+                        # $0 if the step never filled (paper-only win).
                         f1 = _step_filled(pair, ps["round_no"], 1)
-                        pnl = config["stake1"] if f1 is True else 0.0
+                        ratio1 = _step_payout_ratio(pair, ps["round_no"], 1)
+                        pnl = _win_profit(f1, ratio1, config["stake1"])
                         balance += pnl
                         note = "" if f1 is True else (" (fill unknown - check wallet)" if f1 is None else " (paper only - step 1 never filled)")
+                        if f1 is True and ratio1 is not None:
+                            note += f" @{ratio1:.2f}x"
                         send(chat_id, f"✅ WIN {pair} round {ps['round_no']} ${ps['bet_stake']:.0f} on {ps['bet_dir']}. +${pnl:.2f}{note}. Balance ${balance:.2f}")
                         ps["wins"] += 1
                     else:
                         # Step-2 win: round PnL = step-1 loss (if its
-                        # order filled) + step-2 profit (if its order
-                        # filled). Unfilled steps move $0.
+                        # order filled) + step-2 ACTUAL return (v4.18:
+                        # stake2 * (ratio2 - 1), or the flat stake2 if
+                        # the fill payout is unknown). Unfilled steps
+                        # move $0.
                         f1 = _step_filled(pair, ps["round_no"], 1)
                         f2 = _step_filled(pair, ps["round_no"], 2)
-                        pnl = (-config["stake1"] if f1 is True else 0.0) + (config["stake2"] if f2 is True else 0.0)
+                        ratio2 = _step_payout_ratio(pair, ps["round_no"], 2)
+                        pnl = (-config["stake1"] if f1 is True else 0.0) + _win_profit(f2, ratio2, config["stake2"])
                         balance += pnl
                         parts = []
                         for s, f in ((1, f1), (2, f2)):
@@ -2107,6 +2197,8 @@ def bot_loop(chat_id):
                             elif f is None:
                                 parts.append(f"step {s} fill unknown")
                         note = " (" + ", ".join(parts) + ")" if parts else ""
+                        if f2 is True and ratio2 is not None:
+                            note += f" @{ratio2:.2f}x"
                         send(chat_id, f"✅ WIN {pair} round {ps['round_no']} ${ps['bet_stake']:.0f} on {ps['bet_dir']}. Real {pnl:+.2f}{note}. Balance ${balance:.2f}")
                         ps["wins"] += 1
                     ps["state"], ps["bet_open"] = "idle", None
