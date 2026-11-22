@@ -143,6 +143,18 @@ messages show the payout used (e.g. "+$0.70 @1.70x"). Applies to
 both demo and live (shared settlement code). See fill_ratio,
 _step_payout_ratio and _win_profit.
 
+DIAGNOSTIC TRIGGER/SETTLEMENT LOGGING (v4.18.2, 2026-11-22, Sifat):
+every trigger, every settlement decision and every stale-drop writes
+ONE line to the server log (Railway stdout, "[diag] {...}"): bet candle,
+candle open/close/colour, which feed served the candles (own TWAP
+candles or Binance US klines fallback), feed age, and - for
+settlements - how long after the bet candle closed the decision ran.
+Logging only: no Telegram message changes, no trading-logic change,
+no state mutation, and the logger never raises. Built to find the
+cause of the R36 false win (2026-11-21) / B-H10 false loss
+(2026-11-22) class, where the bot's TWAP settlement disagreed with
+both Chainlink and Binance. See _diag, TWAPFeed.diag_info.
+
 ETH 15m FILL FIX (2026-11-16): the ETH 15m orderbook is thin right
 after a market opens, so a market order placed at the trigger often
 finds no seller and gets CANCELLED (round 1 and round 2 both failed
@@ -198,7 +210,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v4.18"  # return-based PnL (2026-11-19, Sifat)
+VERSION = "v4.18.2"  # diagnostic trigger/settlement logging only (2026-11-22, Sifat); v4.18 + logging, no trading-logic change
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
@@ -574,6 +586,7 @@ class TWAPFeed:
         self.candles = []  # kline-format candles: [open_ms, o, h, l, c, 0, close_ms]
         self.last_ts = 0.0
         self.mode = "starting"  # ws | rest | seeded | starting
+        self.last_source = "starting"  # diag only: "twap" or "klines" once closed() has served candles
 
     def twap(self, now=None):
         """60s time-weighted average of the mid-price. None if no samples yet."""
@@ -698,12 +711,22 @@ class TWAPFeed:
             if fresh and self.candles:
                 closed = [list(k) for k in self.candles if int(k[6]) <= now_ms]
                 if len(closed) >= 4:
+                    self.last_source = "twap"
                     return closed[-n:]
         req = urllib.request.Request(self.fallback_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=20) as r:
             raw = json.load(r)
+        self.last_source = "klines"
         closed = [k for k in raw if int(k[6]) <= now_ms]
         return closed[-n:]
+
+    def diag_info(self):
+        """(last candle source, feed age seconds, candle count) - for
+        diagnostic logging only. "twap" = own TWAP candles served by
+        closed(); "klines" = Binance US klines fallback (feed stale)."""
+        with self.lock:
+            age = (time.time() - self.last_ts) if self.last_ts else None
+            return self.last_source, age, len(self.candles)
 
     def status_line(self):
         """One line for /status: which feed is live, the TWAP price, how fresh it is."""
@@ -1310,6 +1333,39 @@ def _pf_remove_order(order_hash):
         return st == "CANCELLED"
     except Exception:
         return False
+
+def _diag_ms_iso(ms):
+    """Epoch ms -> UTC ISO string; "?" if unparseable (diag only)."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000.0))
+    except Exception:
+        return "?"
+
+
+def _diag(pair, event, fields):
+    """Write ONE diagnostic record to the server log (Railway stdout).
+    Never sends Telegram, never touches trading state, never raises.
+    Added v4.18.2 to find the cause of false-win/false-loss
+    settlements: the bot settles from its own TWAP candles, so when
+    its bookkeeping disagrees with Chainlink + Binance, what the bot
+    itself saw is the only evidence."""
+    try:
+        rec = {"diag": event, "pair": pair,
+               "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        rec.update(fields)
+        print("[diag] " + json.dumps(rec, default=str), flush=True)
+    except Exception:
+        pass
+
+
+def _diag_feed(pair):
+    """(source, age_s, n_candles) for the pair feed, read-only."""
+    try:
+        src, age, n = FEEDS[pair].diag_info()
+        return src, (round(age, 1) if age is not None else None), n
+    except Exception:
+        return "unknown", None, None
+
 
 def fetch_closed(pair, n=10):
     """Closed candles for a pair, newest last. Uses that pair's
@@ -2160,10 +2216,34 @@ def bot_loop(chat_id):
                 # bet is stale; drop it instead of staying stuck forever.
                 # (3x the candle length: 15 min for BTC 5m, 45 min for
                 # BTC15, ETH and ETH5 15m.)
+                _diag(pair, "stale_drop", {
+                    "round": ps["round_no"], "state": ps["state"],
+                    "bet_dir": ps["bet_dir"],
+                    "bet_open_ms": bet_open, "bet_open": _diag_ms_iso(bet_open),
+                    "age_min": round((time.time() * 1000 - bet_open) / 60000.0, 1),
+                    "closed_n": len(closed),
+                    "newest_open": _diag_ms_iso(int(closed[-1][0])) if closed else None,
+                    "feed": _diag_feed(pair),
+                })
                 send(chat_id, f"⚠️ {pair} round {ps['round_no']} trade went stale (no candle for {3 * tf_sec // 60} min) - dropping it, no new trade placed.")
                 ps["state"], ps["bet_open"] = "idle", None
             elif done:
                 res = colour(done[0])
+                _diag(pair, "settle", {
+                    "round": ps["round_no"], "state": ps["state"],
+                    "bet_dir": ps["bet_dir"], "win_col": ps["win_col"],
+                    "bet_open_ms": bet_open, "bet_open": _diag_ms_iso(bet_open),
+                    "candle": {"open": _diag_ms_iso(int(done[0][0])),
+                               "o": done[0][1], "h": done[0][2], "l": done[0][3],
+                               "c": done[0][4],
+                               "close": _diag_ms_iso(int(done[0][6]))},
+                    "candle_col": res, "matched": len(done),
+                    "newest_open": _diag_ms_iso(int(closed[-1][0])),
+                    "decision": ("win" if res == ps["win_col"] else
+                                 ("step1-loss" if ps["state"] == "bet1" else "stop")),
+                    "settle_delay_s": round(time.time() - (int(done[0][6]) + 1) / 1000.0, 1),
+                    "feed": _diag_feed(pair),
+                })
                 if res == ps["win_col"]:
                     if ps["state"] == "bet1":
                         # Step-1 win: the ACTUAL return (v4.18), not a
@@ -2255,6 +2335,15 @@ def bot_loop(chat_id):
                 ps["bet_open"] = int(last[6]) + 1
                 tag = "LIVE" if live_running else "Demo"
                 send(chat_id, f"🎯 TRIGGER {pair} round {ps['round_no']}: {n} {'red' if is_up else 'green'}. {tag} trade ${ps['bet_stake']:.0f} on {ps['bet_dir']}.")
+                _diag(pair, "trigger", {
+                    "round": ps["round_no"], "bet_dir": ps["bet_dir"],
+                    "win_col": ps["win_col"], "bet_open_ms": ps["bet_open"],
+                    "bet_open": _diag_ms_iso(ps["bet_open"]),
+                    "run": cols[-n:],
+                    "run_opens": [_diag_ms_iso(int(k[0])) for k in closed[-n:]],
+                    "last_close_ms": int(last[6]),
+                    "feed": _diag_feed(pair),
+                })
                 # Step-1 order: placed now (BTC) or after the pair's delay
                 # (ETH 30s, so the thin book can populate first).
                 _schedule_order(pair)
