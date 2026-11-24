@@ -210,7 +210,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v4.18.2"  # diagnostic trigger/settlement logging only (2026-11-22, Sifat); v4.18 + logging, no trading-logic change
+VERSION = "v4.18.3"  # ETH 15m N=2 -> N=3 only (2026-11-24, Sifat); v4.18.2 + N change, no other change
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
@@ -274,7 +274,7 @@ DEFAULT_CONFIG = {
 # +$415; 7-day: 15m +$34 at 77.6% win vs 5m N=2 +$17 at 70.5%).
 # The old BTC 5m N=4 is KEPT but OFF by default (the user's choice -
 # /btc on turns it back on; first run with BTC15 migrates it off).
-# ETH is the 15m N=2 strategy; ETH5 is a SECOND ETH strategy on the
+# ETH is the 15m N=3 strategy (v4.18.3, was N=2); ETH5 is a SECOND ETH strategy on the
 # same 15m candles with N=5 (added 2026-11-16: 1y backtest N=2 +$1,317,
 # N=5 +$243, together +$1,560 with DD only $55->$65). BTC and BTC15
 # share the BTCUSDT symbol (both feeds get every BTC message, like
@@ -300,7 +300,7 @@ PAIRS = {
                           "https://api.binance.us/api/v3/ticker/bookTicker?symbol=BTCUSDT"],
             "seed_url": "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=12",
             "fallback_url": "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=12"},
-    "ETH": {"symbol": "ETHUSDT", "tf_sec": 900, "n": 2, "category": "eth-updown-15m",
+    "ETH": {"symbol": "ETHUSDT", "tf_sec": 900, "n": 3, "category": "eth-updown-15m",
             "order_delay_sec": 30,
             "ws_stream": "ethusdt@bookTicker",
             "rest_urls": ["https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=ETHUSDT",
