@@ -1,16 +1,17 @@
 {
-  "starting_fund": 30.0,
+  "starting_fund": 40.01,
   "stake1": 1.0,
   "stake2": 2.0,
   "pairs": {
     "BTC": false,
     "BTC15": false,
     "ETH": true,
+        "ETH3": false,
     "ETH5": true,
     "BTC1H": false,
-    "ETH1H": false
+    "ETH1H": true
   },
-  "pause_20": true,
+  "pause_20": false,
   "min_payout": 1.5,
   "pnl_history": {}
 }
