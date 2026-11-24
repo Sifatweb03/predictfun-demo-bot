@@ -210,7 +210,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v4.18.3"  # ETH 15m N=2 -> N=3 only (2026-11-24, Sifat); v4.18.2 + N change, no other change
+VERSION = "v4.18.4"  # ETH N=2 restored + ETH3 (15m N=3) added (2026-11-24, Sifat); nothing removed; v4.18.3 + new pair
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
@@ -230,7 +230,7 @@ DEFAULT_CONFIG = {
     # migration fired and set BTC15=True. Fixed by uploading the correct
     # config AND by making the default + migration OFF here).
     # BTC1H/ETH1H (1h N=2, added v4.14) are OFF by default too.
-    "pairs": {"BTC": False, "BTC15": False, "ETH": True, "ETH5": True,
+    "pairs": {"BTC": False, "BTC15": False, "ETH": True, "ETH3": True, "ETH5": True,
               "BTC1H": False, "ETH1H": False},
     # Pause hour (Dhaka 20:00-21:00) - /pause on|off. Saved, survives a redeploy.
     "pause_20": True,
@@ -274,7 +274,8 @@ DEFAULT_CONFIG = {
 # +$415; 7-day: 15m +$34 at 77.6% win vs 5m N=2 +$17 at 70.5%).
 # The old BTC 5m N=4 is KEPT but OFF by default (the user's choice -
 # /btc on turns it back on; first run with BTC15 migrates it off).
-# ETH is the 15m N=3 strategy (v4.18.3, was N=2); ETH5 is a SECOND ETH strategy on the
+# ETH is the 15m N=2 strategy (restored v4.18.4); ETH3 is the 15m N=3 strategy
+# (added v4.18.4, Sifat); ETH5 is a SECOND ETH strategy on the
 # same 15m candles with N=5 (added 2026-11-16: 1y backtest N=2 +$1,317,
 # N=5 +$243, together +$1,560 with DD only $55->$65). BTC and BTC15
 # share the BTCUSDT symbol (both feeds get every BTC message, like
@@ -300,7 +301,17 @@ PAIRS = {
                           "https://api.binance.us/api/v3/ticker/bookTicker?symbol=BTCUSDT"],
             "seed_url": "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=12",
             "fallback_url": "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=12"},
-    "ETH": {"symbol": "ETHUSDT", "tf_sec": 900, "n": 3, "category": "eth-updown-15m",
+    "ETH": {"symbol": "ETHUSDT", "tf_sec": 900, "n": 2, "category": "eth-updown-15m",
+            "order_delay_sec": 30,
+            "ws_stream": "ethusdt@bookTicker",
+            "rest_urls": ["https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=ETHUSDT",
+                          "https://api.binance.us/api/v3/ticker/bookTicker?symbol=ETHUSDT"],
+            "seed_url": "https://data-api.binance.vision/api/v3/klines?symbol=ETHUSDT&interval=15m&limit=12",
+            "fallback_url": "https://api.binance.us/api/v3/klines?symbol=ETHUSDT&interval=15m&limit=12"},
+    # ETH3: second ETH 15m strategy with N=3 (added v4.18.4, Sifat).
+    # Same market/candles/feed as ETH (N=2) and ETH5 (N=5); its own
+    # state machine and round counter. ON by default.
+    "ETH3": {"symbol": "ETHUSDT", "tf_sec": 900, "n": 3, "category": "eth-updown-15m",
             "order_delay_sec": 30,
             "ws_stream": "ethusdt@bookTicker",
             "rest_urls": ["https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=ETHUSDT",
@@ -1424,6 +1435,7 @@ def handle_command(chat_id, text):
                 f"BTC 5m: 4 red → UP, 4 green → DOWN (OFF by default)\n"
                 f"BTC15 15m: 2 red → UP, 2 green → DOWN (OFF by default)\n"
                 f"ETH 15m: 2 red → UP, 2 green → DOWN\n"
+                f"ETH3 15m: 3 red → UP, 3 green → DOWN\n"
                 f"ETH5 15m: 5 red → UP, 5 green → DOWN\n"
                 f"BTC1H 1h: 2 red → UP, 2 green → DOWN (OFF by default)\n"
                 f"ETH1H 1h: 2 red → UP, 2 green → DOWN (OFF by default)\n"
@@ -1463,6 +1475,7 @@ def handle_command(chat_id, text):
                 "/btc15 on / /btc15 off — turn BTC 15m on or off (OFF by default)\n"
                 "/eth on / /eth off — turn ETH on or off\n"
                 "/eth5 on / /eth5 off — turn ETH N=5 on or off\n"
+                "/eth3 on / /eth3 off — turn ETH N=3 on or off\n"
                 "/btc1h on / /btc1h off — turn BTC 1h on or off (OFF by default)\n"
                 "/eth1h on / /eth1h off — turn ETH 1h on or off (OFF by default)\n"
                 "/pause on / /pause off — pause new trades 20:00-21:00 Dhaka\n"
@@ -1503,7 +1516,7 @@ def handle_command(chat_id, text):
                 f"{per}\n"
                 f"Total Win: {total_wins()} | Loss: {total_losses()} | Round: {total_rounds()}\n"
                 f"Balance: ${balance:.2f}")
-    if cmd in ("/btc", "/btc15", "/eth", "/eth5", "/btc1h", "/eth1h"):
+    if cmd in ("/btc", "/btc15", "/eth", "/eth3", "/eth5", "/btc1h", "/eth1h"):
         name = cmd[1:].upper()
         if not args or args[0].lower() not in ("on", "off"):
             return f"Usage: {cmd} on  or  {cmd} off  (now: {'✅ ON' if pair_enabled(name) else '❌ OFF'})"
@@ -1624,14 +1637,14 @@ def handle_command(chat_id, text):
 
 def bot_loop(chat_id):
     """Paper bot loop: checks candles every 2 sec, notifies on Telegram.
-    Six pairs run independently in this one loop (single thread, so the
+    Seven pairs run independently in this one loop (single thread, so the
     shared balance is never updated by two pairs at once):
       BTC 5m, N=4 reversal (OFF by default). BTC15 15m, N=2 reversal (OFF).
-      ETH 15m, N=2 reversal. ETH5 15m, N=5 reversal.
+      ETH 15m, N=2 reversal. ETH3 15m, N=3 reversal. ETH5 15m, N=5 reversal.
       BTC1H 1h, N=2 reversal (OFF by default). ETH1H 1h, N=2 reversal (OFF).
     Each pair has its own state (idle/bet1/bet2/cooldown), its own round
     counter and win/loss stats, and can be turned off/on from Telegram
-    (/btc off, /btc15 off, /eth off, /eth5 off, /btc1h off, /eth1h off).
+    (/btc off, /btc15 off, /eth off, /eth3 off, /eth5 off, /btc1h off, /eth1h off).
     The fund is shared between the six."""
     global balance, running, day_start_balance, bet_active
     api_errors = 0
