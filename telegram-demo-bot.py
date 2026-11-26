@@ -210,7 +210,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v4.18.4"  # ETH N=2 restored + ETH3 (15m N=3) added (2026-11-24, Sifat); nothing removed; v4.18.3 + new pair
+VERSION = "v4.18.5"  # 1h quote fix (2026-11-26, Sifat): _pf_quote falls back to the human-readable ET slug for 1h markets (e.g. ethereum-up-or-down-november-22-2026-1pm-et); 5m/15m lookup unchanged; nothing removed
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
@@ -1123,6 +1123,38 @@ class LowPayoutSkip(Exception):
         self.price = price
 
 
+def _pf_1h_slug(nxt, pair):
+    """Category slug for a 1h Predict.fun market starting at epoch nxt.
+
+    1h markets do NOT use the {category}-{epoch} slug (that form is only
+    for 5m/15m markets). Their slugs are human-readable US Eastern
+    readings, e.g. 'ethereum-up-or-down-november-22-2026-1pm-et' for a
+    market starting 18:00 UTC on 2026-11-22. The formula below
+    reconstructs all 11,781 1h rounds in the ground-truth history file
+    (2026-03-19..2026-11-22) exactly. The US DST rule (2nd Sunday of
+    March - 1st Sunday of November) is implemented directly so the
+    server needs no tzdata package."""
+    import datetime as _dt
+    utc = _dt.datetime.fromtimestamp(nxt, _dt.timezone.utc)
+
+    def _nth_sunday(year, month, n):
+        first = _dt.date(year, month, 1)
+        delta = (6 - first.weekday()) % 7
+        return first + _dt.timedelta(days=delta + 7 * (n - 1))
+
+    y = utc.year
+    dst_start = _dt.datetime.combine(_nth_sunday(y, 3, 2), _dt.time(7, 0), _dt.timezone.utc)
+    dst_end = _dt.datetime.combine(_nth_sunday(y, 11, 1), _dt.time(6, 0), _dt.timezone.utc)
+    offset = -4 if dst_start <= utc < dst_end else -5
+    et = utc + _dt.timedelta(hours=offset)
+    coin = "bitcoin" if PAIRS[pair]["symbol"].startswith("BTC") else "ethereum"
+    months = ["january", "february", "march", "april", "may", "june", "july",
+              "august", "september", "october", "november", "december"]
+    h12 = et.hour % 12 or 12
+    ap = "am" if et.hour < 12 else "pm"
+    return f"{coin}-up-or-down-{months[et.month - 1]}-{et.day}-{et.year}-{h12}{ap}-et"
+
+
 def _pf_quote(direction, stake, market_start=None, pair="BTC"):
     """Current price for a market order WITHOUT placing anything.
     Returns (market, outcome, price_per_share, amounts, builder, nxt) where
@@ -1138,25 +1170,42 @@ def _pf_quote(direction, stake, market_start=None, pair="BTC"):
     tf_sec = PAIRS[pair]["tf_sec"]
     nxt = int(market_start) if market_start else (int(time.time()) // tf_sec + 1) * tf_sec
     market = None
-    # The category slug IS the market we want. Retry it briefly (a market
-    # that just opened may take a second to appear), but never fall back to
-    # "first market of the rounds list" - that could be a DIFFERENT market
-    # (past or future) and the order would silently bet on the wrong candle.
+    # The category slug IS the market we want - for 5m/15m markets, where
+    # the slug is {category}-{epoch}. 1h markets use a human-readable
+    # Eastern-time slug instead (see _pf_1h_slug), so for 1h pairs try
+    # that slug FIRST and keep the epoch slug as a fallback, in case
+    # Predict.fun ever changes the 1h slug form. For 5m/15m pairs the
+    # lookup is exactly as before (epoch slug only). Retry briefly (a
+    # market that just opened may take a second to appear), but never
+    # fall back to "first market of the rounds list" - that could be a
+    # DIFFERENT market (past or future) and the order would silently
+    # bet on the wrong candle.
     cat = PAIRS[pair]["category"]
+    if tf_sec == 3600:
+        slugs = [_pf_1h_slug(nxt, pair), f"{cat}-{nxt}"]
+    else:
+        slugs = [f"{cat}-{nxt}"]
+    tried = []
     for _attempt in range(3):
-        try:
-            res = _pf_rest("GET", f"/v1/categories/{cat}-{nxt}", jwt=jwt)
-        except Exception:
-            res = None
-        if res:
-            data = res.get("data", res)
-            markets = data.get("markets") or []
-            if markets:
-                market = markets[0]
-                break
+        for slug in slugs:
+            tried.append(slug)
+            try:
+                res = _pf_rest("GET", f"/v1/categories/{slug}", jwt=jwt)
+            except Exception:
+                res = None
+            if res:
+                data = res.get("data", res)
+                markets = data.get("markets") or []
+                if markets:
+                    market = markets[0]
+                    break
+        if market:
+            break
         time.sleep(2)
     if not market:
-        raise RuntimeError(f"No Predict.fun {pair} market for round {nxt} (tried 3x)")
+        raise RuntimeError(
+            f"No Predict.fun {pair} market for round {nxt} "
+            f"(tried 3x: {', '.join(dict.fromkeys(tried))})")
     outcome_name = "Yes" if direction == "UP" else "No"
     outcome = None
     for oc in market.get("outcomes", []):
